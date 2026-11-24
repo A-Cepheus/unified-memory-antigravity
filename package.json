@@ -1,0 +1,34 @@
+{
+  "name": "unified-memory-antigravity",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Antigravity plugin bridging Claude Code memory/rules (read-write) and OpenAI Codex CLI memory (read-only), with a native MCP App UI.",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:hook && npm run build:mcp && npm run build:ui",
+    "build:hook": "esbuild src/hook/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/hook.cjs --minify",
+    "build:mcp": "esbuild src/mcp/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/mcp.cjs --minify",
+    "build:ui": "vite build",
+    "dev:ui": "vite",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.0.1",
+    "@types/node": "^22.15.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.5.0",
+    "esbuild": "^0.25.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vite-plugin-singlefile": "^2.2.0"
+  }
+}

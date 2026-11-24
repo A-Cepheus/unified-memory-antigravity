@@ -1,0 +1,31 @@
+{
+  "unified-memory": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./dist/hook.cjs",
+        "timeout": 15
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "read_file|edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./dist/hook.cjs",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./dist/hook.cjs",
+        "timeout": 10
+      }
+    ]
+  }
+}

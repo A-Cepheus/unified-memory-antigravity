@@ -1,0 +1,14 @@
+{
+  "name": "unified-memory-antigravity",
+  "displayName": "Unified Memory",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code Auto Memory & CLAUDE.md/.claude/rules (read-write) with OpenAI Codex CLI memory (read-only), plus a native Antigravity Desktop management UI.",
+  "logo": "assets/logo.svg",
+  "homepage": "https://github.com/A-Cepheus/unified-memory-antigravity",
+  "repository": "https://github.com/A-Cepheus/unified-memory-antigravity",
+  "suggestedPrompts": [
+    "Open the Unified Memory dashboard to inspect project memories and loaded rules",
+    "Search my Claude and Codex memories for context on the current project",
+    "Audit and consolidate stale entries in this project's Claude Auto Memory"
+  ]
+}

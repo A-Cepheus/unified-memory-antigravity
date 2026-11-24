@@ -1,0 +1,8 @@
+node_modules/
+package-lock.json
+.DS_Store
+*.log
+.vite/
+coverage/
+# Note: dist/ is intentionally committed so users can install directly from GitHub
+# via `agy plugin install <repo-url>` without a local build step.

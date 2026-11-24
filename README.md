@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/Codex%20CLI-v1%2Fv2%20Read--Only-10B981?style=flat-square" alt="Codex CLI Read-Only" />
   <img src="https://img.shields.io/badge/Node.js-%E2%89%A520-0EA5E9?style=flat-square" alt="Node.js 20+" />
   <img src="https://img.shields.io/badge/Install-Zero--Compile-334155?style=flat-square" alt="Zero-Compile Install" />
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" /></a>
 </p>
 
 <p>
@@ -24,7 +25,8 @@
   <a href="#how-it-works">How It Works</a> ·
   <a href="#features">Features</a> ·
   <a href="#tools-skills--rules">Tools &amp; Skills</a> ·
-  <a href="#configuration">Configuration</a>
+  <a href="#configuration">Configuration</a> ·
+  <a href="#disclaimer--license">License</a>
 </p>
 
 </div>
@@ -47,19 +49,29 @@
 > [!TIP]
 > Pre-bundled, zero-dependency runtime bundles (`dist/hook.cjs`, `dist/mcp.cjs`, `dist/app.html`) are committed in this repo — installing requires only **Node.js 20+** and **zero compilation**.
 
-### Install via Antigravity CLI
+### Option 1: Install from GitHub via Antigravity CLI (Recommended)
 
 ```bash
 agy plugin install https://github.com/A-Cepheus/unified-memory-antigravity
 ```
 
-### Or Clone & Symlink Locally
+### Option 2: Install from a Local Clone via CLI
 
 ```bash
 git clone https://github.com/A-Cepheus/unified-memory-antigravity.git
-cd unified-memory-antigravity
-ln -s "$(pwd)" ~/.gemini/config/plugins/unified-memory-antigravity
+agy plugin install ./unified-memory-antigravity
 ```
+
+### Option 3: Manual / Dev Installation (Global or Workspace)
+
+- **Global (all workspaces)** — symlink or copy into `~/.gemini/config/plugins/`:
+
+  ```bash
+  git clone https://github.com/A-Cepheus/unified-memory-antigravity.git
+  ln -s "$(pwd)/unified-memory-antigravity" ~/.gemini/config/plugins/unified-memory-antigravity
+  ```
+
+- **Workspace-level (team sharing)** — place the plugin directory under `<repo>/.agents/plugins/unified-memory-antigravity/`.
 
 Antigravity discovers the plugin automatically without restarting. Open **Unified Memory** from the **left sidebar** or the **side pane `+` menu**.
 
@@ -220,3 +232,13 @@ npm test
 
 - **100% Local**: All reading, writing, and indexing happen locally on your filesystem — zero telemetry, zero external network calls.
 - Contributions and issue reports are welcome.
+
+---
+
+## Disclaimer & License
+
+- **Independent Community Project**: `unified-memory-antigravity` is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Google, Anthropic, or OpenAI. All product names and trademarks belong to their respective owners.
+- **Local Plaintext Interoperability Only**: This plugin operates exclusively on local plaintext Markdown memory and rule files (`~/.claude/projects/*/memory/`, `CLAUDE.md`, `.claude/rules/`, and read-only `~/.codex/memories*`). It never reads or reuses authentication credentials, API keys, OAuth tokens, or private cloud endpoints.
+- **Cross-Model Data Flow Notice**: Local memories injected into an Antigravity conversation become part of the prompt sent to your active Antigravity model provider. If you operate under enterprise data-boundary or DPA policies, verify that sharing local Claude/Codex notes across tools complies with your organization's rules (you can disable Codex startup injection via `injectCodexSummaryOnStart: false` or Claude Auto Memory via `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`).
+- **License**: Released under the [MIT License](./LICENSE).
+

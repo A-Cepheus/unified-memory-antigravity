@@ -2,6 +2,7 @@
   "name": "unified-memory-antigravity",
   "version": "0.1.0",
   "private": false,
+  "license": "MIT",
   "description": "Antigravity plugin bridging Claude Code memory/rules (read-write) and OpenAI Codex CLI memory (read-only), with a native MCP App UI.",
   "type": "module",
   "scripts": {

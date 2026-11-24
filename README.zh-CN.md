@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/Codex%20CLI-v1%2Fv2%20Read--Only-10B981?style=flat-square" alt="Codex CLI Read-Only" />
   <img src="https://img.shields.io/badge/Node.js-%E2%89%A520-0EA5E9?style=flat-square" alt="Node.js 20+" />
   <img src="https://img.shields.io/badge/Install-Zero--Compile-334155?style=flat-square" alt="Zero-Compile Install" />
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-64748B?style=flat-square" alt="MIT License" /></a>
 </p>
 
 <p>
@@ -24,7 +25,8 @@
   <a href="#工作原理">工作原理</a> ·
   <a href="#核心特性">核心特性</a> ·
   <a href="#工具技能与规范">工具与技能</a> ·
-  <a href="#配置说明">配置说明</a>
+  <a href="#配置说明">配置说明</a> ·
+  <a href="#免责声明与开源协议">开源协议</a>
 </p>
 
 </div>
@@ -47,19 +49,29 @@
 > [!TIP]
 > 仓库已提交零依赖预构建单文件产物（`dist/hook.cjs`、`dist/mcp.cjs`、`dist/app.html`），安装只需 **Node.js 20+**，**无需 `npm install` 或本地编译**。
 
-### 方式一：通过 Antigravity CLI 安装
+### 方式一：通过 Antigravity CLI 从 GitHub 直装（推荐）
 
 ```bash
 agy plugin install https://github.com/A-Cepheus/unified-memory-antigravity
 ```
 
-### 方式二：本地克隆并软链
+### 方式二：克隆后通过 CLI 本地安装
 
 ```bash
 git clone https://github.com/A-Cepheus/unified-memory-antigravity.git
-cd unified-memory-antigravity
-ln -s "$(pwd)" ~/.gemini/config/plugins/unified-memory-antigravity
+agy plugin install ./unified-memory-antigravity
 ```
+
+### 方式三：手动 / 开发安装（全局或项目级）
+
+- **全局安装（所有工作区生效）** —— 软链或复制到 `~/.gemini/config/plugins/`：
+
+  ```bash
+  git clone https://github.com/A-Cepheus/unified-memory-antigravity.git
+  ln -s "$(pwd)/unified-memory-antigravity" ~/.gemini/config/plugins/unified-memory-antigravity
+  ```
+
+- **项目级安装（团队随仓库共享）** —— 将插件目录放入 `<repo>/.agents/plugins/unified-memory-antigravity/`。
 
 Antigravity 无需重启即可自动发现插件。安装完成后，从 **左侧边栏** 或 **右侧辅助栏 `+` 菜单** 即可打开 **Unified Memory**。
 
@@ -220,3 +232,13 @@ npm test
 
 - **100% 本地运行**：所有读写与检索均在本地文件系统完成，无遥测、无外部网络请求。
 - 欢迎提交 Issue 与 Pull Request。
+
+---
+
+## 免责声明与开源协议
+
+- **独立社区项目**：`unified-memory-antigravity` 为独立开源项目，与 Google、Anthropic 或 OpenAI 无隶属、背书或赞助关系；文中提及的产品名与商标归各自所有者所有。
+- **仅限本地明文文件互操作**：本插件仅读写用户本机硬盘上的明文 Markdown 记忆与规则文件（`~/.claude/projects/*/memory/`、`CLAUDE.md`、`.claude/rules/` 以及严格只读的 `~/.codex/memories*`），**绝不**读取或复用任何账号凭据、API Key、OAuth Token 或私有云端接口。
+- **跨模型数据流提示**：被注入到 Antigravity 会话中的本地记忆会随对话上下文发送至当前 Antigravity 所使用的模型服务商。若你处于企业数据隔离或 DPA 合规约束环境下，请先确认跨工具共享本地笔记符合所在组织政策（可在配置中设 `injectCodexSummaryOnStart: false` 关闭 Codex 注入，或设置 `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` 禁用 Claude 自动记忆注入）。
+- **开源协议**：基于 [MIT License](./LICENSE) 发布。
+

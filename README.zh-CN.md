@@ -89,7 +89,7 @@ flowchart LR
 
     subgraph Plugin["unified-memory-antigravity"]
         HK["Hook 执行器 (dist/hook.cjs)\nSessionStart · PostToolUse · PreInvocation"]
-        MCP["MCP 服务 (dist/mcp.cjs)\n10 个模型工具 + 10 个 UI 专用工具"]
+        MCP["MCP 服务 (dist/mcp.cjs)\n10 个模型工具 + 11 个 UI 专用工具"]
         UI["原生桌面面板 (dist/app.html)\n左侧边栏 (global) & 侧边面板 (aux_pane)"]
     end
 
@@ -124,6 +124,7 @@ flowchart LR
 ### 2. `CLAUDE.md` 与 `.claude/rules/`（对齐 Claude Code 语义）
 - **完整层级加载**：跨多根工作区按 `Managed → User → Ancestor → Project → CLAUDE.local.md` 顺序加载。
 - **智能解析与去重**：支持最多 5 跳 `@import` 展开（含循环检测与代码块跳过）、剔除代码块外的 HTML 注释、应用 `claudeMdExcludes`，并对 Antigravity 原生加载的 `@AGENTS.md` 自动去重。
+- **外部导入与软链授权边界**：区分用户级/策略级规则（`~/.claude/CLAUDE.md`、`~/.claude/rules/`，默认可信）与仓库级规则（`CLAUDE.md`、`.claude/CLAUDE.md`、`.claude/rules/`、`CLAUDE.local.md`、子目录/祖先规则）。仓库级规则指向工作区外的 `@import` 或规则符号链接默认拦截，可在对模型隐藏的 **Rules & Context** 面板按文件/目录授权，同时自动只读兼容 Claude Code `~/.claude.json` 中已批准的项目。
 - **两阶段懒加载**：`PostToolUse`（`read_file|edit_file|write_file`）匹配命中的 `paths:` 规则（支持 `**` 与 `{a,b}` 展开）和子目录 `CLAUDE.md` 入队，`PreInvocation` 在下一轮模型调用前精准注入。
 
 ### 3. OpenAI Codex CLI 记忆（`严格只读`）
@@ -159,7 +160,7 @@ flowchart LR
 | `codex_memory_read` | 只读 | 读取允许路径沙箱内的单个 Codex 记忆文件（只读） |
 
 > [!NOTE]
-> 另有 10 个 `ui_*` 工具专供内嵌 MCP App 使用，均标记 `visibility: ["app"]`，对模型完全隐藏，不占用模型工具上下文。
+> 另有 11 个 `ui_*` 工具专供内嵌 MCP App 使用（含仅用户可操作的外部规则授权管理），均标记 `visibility: ["app"]`，对模型完全隐藏，不占用模型工具上下文。
 
 ### 内置技能与常驻规范
 - **`memory-manage`**（`skills/memory-manage/SKILL.md`）—— 交互式记忆与规则诊断工作流（对标 Claude Code 的 `/memory`）。
@@ -178,6 +179,8 @@ flowchart LR
 | `codexSummaryMaxBytes` | `8192` | 启动注入 Codex `memory_summary.md` 的最大字节数 |
 | `injectCodexGlobalAgentsMd` | `false` | 是否同时在启动时注入 `~/.codex/AGENTS.md`（及 `AGENTS.override.md`） |
 | `deduplicateNativeAgentsMd` | `true` | 是否跳过已被 Antigravity 原生加载的 `@AGENTS.md` 导入 |
+| `trustClaudeCodeExternalApprovals` | `true` | 是否只读复用 `~/.claude.json` 中已在 Claude Code 批准的项目外部导入授权 |
+| `externalRuleTrust` | `{}` | 按工作区保存的外部 `@import` / 规则软链精确白名单与黑名单（通过 UI 管理） |
 | `maxStartupInjectBytes` | `65536` | `SessionStart` 合并注入内容的总字节上限 |
 
 <details>

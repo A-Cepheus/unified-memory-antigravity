@@ -10,11 +10,14 @@ import {
   expandAtImports,
   extractTopicMetadata,
   findSubdirectoryClaudeMds,
+  findSubdirectoryClaudeMdsWithDiagnostics,
   getCodexMemoryStatus,
   listTopicMemories,
   loadClaudeRulesForWorkspaces,
+  loadConditionalRuleContentWithDiagnostics,
   matchesGlobPatterns,
   parseFrontmatter,
+  readClaudeCodeExternalApproval,
   readCodexMemoryFile,
   readCodexSummary,
   readMemoryIndex,
@@ -24,6 +27,7 @@ import {
   stripCodexVersionHeader,
   stripHtmlComments,
   truncateMemoryIndex,
+  updateWorkspaceExternalTrust,
 } from '../src/core/index.js';
 
 function mkTempDir(prefix: string): string {
@@ -262,6 +266,312 @@ describe('CLAUDE.md & .claude/rules loading, @imports, comments, globs, and subd
       fs.writeFileSync(path.join(ws, 'b.md'), '@a.md\nB_BODY\n');
       const exp = expandAtImports('@b.md\nA_BODY\n', path.join(ws, 'a.md'));
       assert.ok(exp.content.includes('B_BODY'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('enforces external @import and rule symlink trust for repo rules while trusting user-level rules', () => {
+    const root = mkTempDir('um-ext-trust-');
+    try {
+      const fakeClaude = path.join(root, '.claude-global');
+      const extDir = path.join(root, 'external-notes');
+      const otherExtDir = path.join(root, 'other-secret');
+      const wsA = path.join(root, 'repo-a');
+      const wsB = path.join(root, 'repo-b');
+      const pluginData = path.join(root, 'plugin-data');
+
+      fs.mkdirSync(path.join(fakeClaude, 'rules'), { recursive: true });
+      fs.mkdirSync(extDir, { recursive: true });
+      fs.mkdirSync(otherExtDir, { recursive: true });
+      fs.mkdirSync(path.join(wsA, '.claude', 'rules'), { recursive: true });
+      fs.mkdirSync(path.join(wsA, 'docs'), { recursive: true });
+      fs.mkdirSync(path.join(wsA, 'subpkg'), { recursive: true });
+      fs.mkdirSync(wsB, { recursive: true });
+
+      const styleFile = path.join(extDir, 'writing-style.md');
+      const sharedRuleFile = path.join(extDir, 'shared-rule.md');
+      const userExtRuleFile = path.join(otherExtDir, 'user-only-rule.md');
+      const secretFile = path.join(otherExtDir, 'secret.md');
+      fs.writeFileSync(styleFile, 'EXT_STYLE_CONTENT\n');
+      fs.writeFileSync(sharedRuleFile, 'EXT_SHARED_RULE_CONTENT\n');
+      fs.writeFileSync(userExtRuleFile, 'USER_EXT_SYMLINK_CONTENT\n');
+      fs.writeFileSync(secretFile, 'EXT_SECRET_CONTENT\n');
+      // Escape symlink inside external shared dir pointing to a different unapproved dir
+      fs.symlinkSync(secretFile, path.join(extDir, 'escape.md'));
+
+      // User-level rules (trusted by default)
+      fs.writeFileSync(path.join(fakeClaude, 'CLAUDE.md'), `@${styleFile}\nUSER_OWN_RULE\n`);
+      fs.symlinkSync(userExtRuleFile, path.join(fakeClaude, 'rules', 'user-ext-link.md'));
+      fs.writeFileSync(
+        path.join(fakeClaude, 'rules', 'user-scoped.md'),
+        `---\npaths:\n  - "subpkg/**/*.ts"\n---\n@${styleFile}\nUSER_SCOPED_OK\n`,
+      );
+
+      // Repo A: intra-workspace safe links + untrusted external imports/symlinks
+      fs.writeFileSync(path.join(wsA, 'docs', 'inner.md'), `@${secretFile}\nINNER_DOC_BODY\n`);
+      fs.writeFileSync(path.join(wsA, 'docs', 'local-rule.md'), 'INTRA_WS_SYMLINK_RULE\n');
+      fs.symlinkSync(secretFile, path.join(wsA, 'docs', 'sym-to-secret.md'));
+      fs.writeFileSync(
+        path.join(wsA, 'CLAUDE.md'),
+        [
+          '# Repo A',
+          `@${styleFile}`,
+          '@docs/inner.md',
+          '@docs/sym-to-secret.md',
+          '@/components/Button', // non-existent TS alias must not false-positive
+          'REPO_A_SAFE_BODY',
+        ].join('\n') + '\n',
+      );
+      fs.writeFileSync(path.join(wsA, 'CLAUDE.local.md'), `@${secretFile}\nLOCAL_SAFE_BODY\n`);
+      fs.symlinkSync(
+        path.join(wsA, 'docs', 'local-rule.md'),
+        path.join(wsA, '.claude', 'rules', 'intra-link.md'),
+      );
+      fs.symlinkSync(sharedRuleFile, path.join(wsA, '.claude', 'rules', 'ext-link.md'));
+      fs.symlinkSync(extDir, path.join(wsA, '.claude', 'rules', 'ext-dir'));
+      fs.writeFileSync(path.join(wsA, 'subpkg', 'CLAUDE.md'), `@${secretFile}\nSUBPKG_SAFE\n`);
+      fs.writeFileSync(path.join(wsA, 'subpkg', 'app.ts'), 'export const a = 1;\n');
+
+      // Repo B tries cross-workspace import into Repo A
+      fs.writeFileSync(path.join(wsA, 'private.md'), 'WS_A_PRIVATE_CONTENT\n');
+      fs.writeFileSync(path.join(wsB, 'CLAUDE.md'), `@../repo-a/private.md\nREPO_B_BODY\n`);
+
+      // 1. Default fail-closed check
+      const initial = loadClaudeRulesForWorkspaces([wsA, wsB], {
+        claudeConfigDir: fakeClaude,
+        deduplicateNativeAgentsMd: true,
+      });
+
+      // User-level rules MUST expand external imports & symlinks automatically
+      const globalText = initial.globalAlwaysOn.map((r) => r.content).join('\n');
+      assert.ok(globalText.includes('EXT_STYLE_CONTENT'));
+      assert.ok(globalText.includes('USER_EXT_SYMLINK_CONTENT'));
+      assert.equal(initial.globalConditional.length, 1);
+      assert.ok(initial.globalConditional[0].content.includes('EXT_STYLE_CONTENT'));
+
+      // Lazy load of user_rule MUST keep trusted scope
+      const lazyUser = loadConditionalRuleContentWithDiagnostics(
+        path.join(fakeClaude, 'rules', 'user-scoped.md'),
+        wsA,
+        'user_rule',
+        { claudeConfigDir: fakeClaude },
+      );
+      assert.ok(lazyUser.entry?.content.includes('EXT_STYLE_CONTENT'));
+      assert.equal(lazyUser.blocked.length, 0);
+
+      // Repo A MUST block all external targets while allowing intra-workspace symlinks & normal docs
+      const bundleA = initial.workspaces.find((w) => w.workspaceRoot === path.resolve(wsA))!;
+      const repoAText = bundleA.alwaysOn.map((r) => r.content).join('\n');
+      assert.ok(repoAText.includes('REPO_A_SAFE_BODY'));
+      assert.ok(repoAText.includes('INNER_DOC_BODY'));
+      assert.ok(repoAText.includes('INTRA_WS_SYMLINK_RULE'));
+      assert.ok(repoAText.includes('LOCAL_SAFE_BODY'));
+      assert.ok(repoAText.includes('@/components/Button')); // untouched non-existent alias
+      assert.ok(!repoAText.includes('EXT_STYLE_CONTENT'));
+      assert.ok(!repoAText.includes('EXT_SHARED_RULE_CONTENT'));
+      assert.ok(!repoAText.includes('EXT_SECRET_CONTENT'));
+
+      assert.ok(
+        bundleA.blockedExternalTargets.some(
+          (b) => b.kind === 'external_import' && b.resolvedTarget === fs.realpathSync(styleFile),
+        ),
+      );
+      assert.ok(
+        bundleA.blockedExternalTargets.some(
+          (b) => b.kind === 'external_import' && b.resolvedTarget === fs.realpathSync(secretFile),
+        ),
+      );
+      assert.ok(
+        bundleA.blockedExternalTargets.some(
+          (b) =>
+            b.kind === 'external_rule_symlink' &&
+            b.resolvedTarget === fs.realpathSync(sharedRuleFile),
+        ),
+      );
+      assert.ok(
+        bundleA.blockedExternalTargets.some(
+          (b) =>
+            b.kind === 'external_rule_dir_symlink' &&
+            b.targetIsDir === true &&
+            b.resolvedTarget === fs.realpathSync(extDir),
+        ),
+      );
+      // Non-existent TS alias must not appear in blocked list
+      assert.ok(!bundleA.blockedExternalTargets.some((b) => b.rawRef === '/components/Button'));
+
+      // Repo B MUST NOT read Repo A's private file (strict per-workspace boundary in multi-root)
+      const bundleB = initial.workspaces.find((w) => w.workspaceRoot === path.resolve(wsB))!;
+      const repoBText = bundleB.alwaysOn.map((r) => r.content).join('\n');
+      assert.ok(repoBText.includes('REPO_B_BODY'));
+      assert.ok(!repoBText.includes('WS_A_PRIVATE_CONTENT'));
+      assert.equal(bundleB.blockedExternalTargets.length, 1);
+
+      // Subdir CLAUDE.md MUST also block external imports
+      const subRes = findSubdirectoryClaudeMdsWithDiagnostics(
+        path.join(wsA, 'subpkg', 'app.ts'),
+        wsA,
+        { claudeConfigDir: fakeClaude },
+      );
+      assert.equal(subRes.entries.length, 1);
+      assert.ok(subRes.entries[0].content.includes('SUBPKG_SAFE'));
+      assert.ok(!subRes.entries[0].content.includes('EXT_SECRET_CONTENT'));
+      assert.equal(subRes.blocked.length, 1);
+
+      // 2. Target-scoped plugin allowlist approves ONLY the exact approved file (no Day-2 drift)
+      const afterFileAllow = updateWorkspaceExternalTrust(wsA, 'allow', styleFile, pluginData);
+      const loadedFileAllow = loadClaudeRulesForWorkspaces([wsA], {
+        claudeConfigDir: fakeClaude,
+        externalRuleTrust: afterFileAllow.config.externalRuleTrust,
+      });
+      const textAfterFileAllow = loadedFileAllow.workspaces[0].alwaysOn
+        .map((r) => r.content)
+        .join('\n');
+      assert.ok(textAfterFileAllow.includes('EXT_STYLE_CONTENT'));
+      assert.ok(!textAfterFileAllow.includes('EXT_SHARED_RULE_CONTENT'));
+      assert.ok(!textAfterFileAllow.includes('EXT_SECRET_CONTENT'));
+
+      // 3. Directory prefix allowlist approves extDir symlink & files inside, but STILL blocks escape.md -> otherExtDir
+      const afterDirAllow = updateWorkspaceExternalTrust(wsA, 'allow', extDir, pluginData);
+      const loadedDirAllow = loadClaudeRulesForWorkspaces([wsA], {
+        claudeConfigDir: fakeClaude,
+        externalRuleTrust: afterDirAllow.config.externalRuleTrust,
+      });
+      const textAfterDirAllow = loadedDirAllow.workspaces[0].alwaysOn
+        .map((r) => r.content)
+        .join('\n');
+      assert.ok(textAfterDirAllow.includes('EXT_STYLE_CONTENT'));
+      assert.ok(textAfterDirAllow.includes('EXT_SHARED_RULE_CONTENT'));
+      assert.ok(!textAfterDirAllow.includes('EXT_SECRET_CONTENT')); // escape symlink inside extDir still blocked!
+
+      // 4. Native Claude Code ~/.claude.json project approval interop (read-only) + plugin deny override
+      const claudeStateFile = path.join(fakeClaude, '.claude.json');
+      fs.writeFileSync(
+        claudeStateFile,
+        JSON.stringify(
+          {
+            projects: {
+              [path.resolve(wsA)]: {
+                hasClaudeMdExternalIncludesApproved: true,
+                hasClaudeMdExternalIncludesWarningShown: true,
+              },
+              [path.resolve(wsB)]: {
+                hasClaudeMdExternalIncludesApproved: false,
+                hasClaudeMdExternalIncludesWarningShown: true,
+              },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      const ccStateA = readClaudeCodeExternalApproval(wsA, { claudeConfigDir: fakeClaude });
+      assert.equal(ccStateA?.approved, true);
+
+      // With Claude Code approval active, Repo A loads all external targets without plugin allowlist
+      const loadedCcApproved = loadClaudeRulesForWorkspaces([wsA, wsB], {
+        claudeConfigDir: fakeClaude,
+        trustClaudeCodeExternalApprovals: true,
+      });
+      const ccTextA = loadedCcApproved.workspaces[0].alwaysOn.map((r) => r.content).join('\n');
+      assert.ok(ccTextA.includes('EXT_STYLE_CONTENT'));
+      assert.ok(ccTextA.includes('EXT_SECRET_CONTENT'));
+      assert.equal(loadedCcApproved.workspaces[0].blockedExternalTargets.length, 0);
+      // Repo B was declined in Claude Code -> status denied_by_claude_code
+      assert.equal(
+        loadedCcApproved.workspaces[1].blockedExternalTargets[0]?.status,
+        'denied_by_claude_code',
+      );
+
+      // Disabling trustClaudeCodeExternalApprovals falls back to fail-closed
+      const loadedCcDisabled = loadClaudeRulesForWorkspaces([wsA], {
+        claudeConfigDir: fakeClaude,
+        trustClaudeCodeExternalApprovals: false,
+      });
+      assert.ok(
+        !loadedCcDisabled.workspaces[0].alwaysOn.map((r) => r.content).join('\n').includes('EXT_SECRET_CONTENT'),
+      );
+
+      // Explicit plugin deny overrides Claude Code project approval
+      const cleared = updateWorkspaceExternalTrust(wsA, 'clear_workspace', undefined, pluginData);
+      assert.equal(cleared.trust.allowPaths.length, 0);
+      const afterDeny = updateWorkspaceExternalTrust(wsA, 'deny', secretFile, pluginData);
+      const loadedDenyOverride = loadClaudeRulesForWorkspaces([wsA], {
+        claudeConfigDir: fakeClaude,
+        trustClaudeCodeExternalApprovals: true,
+        externalRuleTrust: afterDeny.config.externalRuleTrust,
+      });
+      const denyOverrideText = loadedDenyOverride.workspaces[0].alwaysOn
+        .map((r) => r.content)
+        .join('\n');
+      assert.ok(denyOverrideText.includes('EXT_STYLE_CONTENT'));
+      assert.ok(!denyOverrideText.includes('EXT_SECRET_CONTENT'));
+      assert.ok(
+        loadedDenyOverride.workspaces[0].blockedExternalTargets.some(
+          (b) =>
+            b.resolvedTarget === fs.realpathSync(secretFile) && b.status === 'denied_by_plugin',
+        ),
+      );
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks symlinked root CLAUDE.md and allows same-repo monorepo ancestor imports while blocking external ones', () => {
+    const root = mkTempDir('um-monorepo-');
+    try {
+      const fakeClaude = path.join(root, '.claude-global');
+      const outside = path.join(root, 'outside');
+      const mono = path.join(root, 'monorepo');
+      const appPkg = path.join(mono, 'packages', 'app');
+      const symWs = path.join(root, 'sym-repo');
+
+      fs.mkdirSync(fakeClaude, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      fs.mkdirSync(path.join(mono, 'docs'), { recursive: true });
+      fs.mkdirSync(appPkg, { recursive: true });
+      fs.mkdirSync(symWs, { recursive: true });
+
+      const extSecret = path.join(outside, 'secret.md');
+      fs.writeFileSync(extSecret, 'OUTSIDE_MONO_SECRET\n');
+      fs.writeFileSync(path.join(mono, 'docs', 'arch.md'), 'SAME_MONO_ARCH_DOC\n');
+      fs.writeFileSync(
+        path.join(mono, 'CLAUDE.md'),
+        `@docs/arch.md\n@${extSecret}\nMONO_ROOT_RULE\n`,
+      );
+      fs.writeFileSync(path.join(appPkg, 'CLAUDE.md'), 'APP_PKG_RULE\n');
+
+      execFileSync('git', ['init', '-b', 'main'], { cwd: mono, stdio: 'ignore' });
+
+      // Workspace with root CLAUDE.md symlinked outside & .claude/rules symlinked outside
+      fs.symlinkSync(extSecret, path.join(symWs, 'CLAUDE.md'));
+      fs.mkdirSync(path.join(symWs, '.claude'), { recursive: true });
+      fs.symlinkSync(outside, path.join(symWs, '.claude', 'rules'));
+
+      const loaded = loadClaudeRulesForWorkspaces([appPkg, symWs], {
+        claudeConfigDir: fakeClaude,
+      });
+
+      const monoBundle = loaded.workspaces.find((w) => w.workspaceRoot === path.resolve(appPkg))!;
+      const monoText = monoBundle.alwaysOn.map((r) => r.content).join('\n');
+      assert.ok(monoText.includes('SAME_MONO_ARCH_DOC'));
+      assert.ok(monoText.includes('MONO_ROOT_RULE'));
+      assert.ok(monoText.includes('APP_PKG_RULE'));
+      assert.ok(!monoText.includes('OUTSIDE_MONO_SECRET'));
+      assert.equal(monoBundle.blockedExternalTargets.length, 1);
+
+      const symBundle = loaded.workspaces.find((w) => w.workspaceRoot === path.resolve(symWs))!;
+      assert.equal(symBundle.alwaysOn.length, 0);
+      assert.ok(
+        symBundle.blockedExternalTargets.some(
+          (b) => b.kind === 'external_rule_symlink' && b.sourceDisplayPath === 'CLAUDE.md',
+        ),
+      );
+      assert.ok(
+        symBundle.blockedExternalTargets.some(
+          (b) => b.kind === 'external_rule_dir_symlink' && b.sourceDisplayPath === '.claude/rules',
+        ),
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

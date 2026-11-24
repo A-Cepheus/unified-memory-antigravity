@@ -5,12 +5,12 @@ import {
   appendDiagnosticEvent,
   createEmptySessionState,
   detectCompaction,
-  findSubdirectoryClaudeMds,
+  findSubdirectoryClaudeMdsWithDiagnostics,
   gcStaleSessions,
   getClaudeConfigDir,
   getCodexHome,
   loadClaudeRulesForWorkspaces,
-  loadConditionalRuleContent,
+  loadConditionalRuleContentWithDiagnostics,
   loadPluginConfig,
   loadSessionState,
   matchesGlobPatterns,
@@ -100,6 +100,13 @@ function clampUtf8(text: string, maxBytes: number): { content: string; truncated
   return { content: out.join('\n'), truncated: true };
 }
 
+function formatPendingExternalNotice(pendingCount: number): string {
+  return (
+    `> [Unified Memory] Skipped ${pendingCount} unapproved external rule import(s)/symlink(s) outside this workspace. ` +
+    `Open the Unified Memory dashboard (Rules & Context tab) to review and approve if trusted.`
+  );
+}
+
 function buildBaselineInjection(
   workspacePaths: string[],
   config: UnifiedMemoryConfig,
@@ -116,6 +123,8 @@ function buildBaselineInjection(
   const rulesLoaded = loadClaudeRulesForWorkspaces(workspacePaths, {
     claudeConfigDir,
     deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd,
+    trustClaudeCodeExternalApprovals: config.trustClaudeCodeExternalApprovals,
+    externalRuleTrust: config.externalRuleTrust,
   });
 
   const sections: string[] = [];
@@ -157,13 +166,21 @@ function buildBaselineInjection(
   const seenMemoryDirs = new Set<string>();
   for (const wsBundle of rulesLoaded.workspaces) {
     const wsName = path.basename(wsBundle.workspaceRoot) || wsBundle.workspaceRoot;
+    const dormantConditionalFiles = new Set(wsBundle.conditional.map((c) => c.filePath));
+    const pendingExternalCount = wsBundle.blockedExternalTargets.filter(
+      (b) => b.status === 'pending_approval' && !dormantConditionalFiles.has(b.sourceFile),
+    ).length;
 
-    if (wsBundle.alwaysOn.length > 0) {
+    if (wsBundle.alwaysOn.length > 0 || pendingExternalCount > 0) {
       const blocks: string[] = [];
       for (const r of wsBundle.alwaysOn) {
         fileMtimes[r.filePath] = r.mtimeMs;
         labels.push(`${wsName}/${r.displayPath}`);
         blocks.push(`### ${r.displayPath} (${r.scope})\n${r.content}`);
+      }
+      if (pendingExternalCount > 0) {
+        labels.push(`blocked-external:${wsName}:${pendingExternalCount}`);
+        blocks.push(formatPendingExternalNotice(pendingExternalCount));
       }
       sections.push(
         `## Project Claude Instructions (${wsName} — ${wsBundle.workspaceRoot})\n${blocks.join('\n\n')}`,
@@ -326,6 +343,8 @@ function handlePostToolUse(
     const loaded = loadClaudeRulesForWorkspaces(workspacePaths, {
       claudeConfigDir: getClaudeConfigDir(process.env),
       deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd,
+      trustClaudeCodeExternalApprovals: config.trustClaudeCodeExternalApprovals,
+      externalRuleTrust: config.externalRuleTrust,
     });
     for (const wsBundle of loaded.workspaces) {
       for (const c of wsBundle.conditional) {
@@ -373,6 +392,7 @@ function handlePostToolUse(
       state.pendingInjections.push({
         key: rule.id,
         kind: 'scoped_rule',
+        scope: rule.scope,
         filePath: rule.filePath,
         displayPath: rule.displayPath,
         workspaceRoot: wsRoot,
@@ -388,16 +408,21 @@ function handlePostToolUse(
   for (const wsRoot of effectiveWorkspaces) {
     const absWs = path.resolve(wsRoot);
     if (accessedPath !== absWs && !accessedPath.startsWith(absWs + path.sep)) continue;
-    const subdirs = findSubdirectoryClaudeMds(accessedPath, absWs, {
+    const subResult = findSubdirectoryClaudeMdsWithDiagnostics(accessedPath, absWs, {
       claudeConfigDir: getClaudeConfigDir(process.env),
       deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd,
+      trustClaudeCodeExternalApprovals: config.trustClaudeCodeExternalApprovals,
+      externalRuleTrust: config.externalRuleTrust,
     });
-    for (const sub of subdirs) {
+    const relTriggered = path.relative(absWs, accessedPath).replace(/\\/g, '/');
+    const queuedSubdirFiles = new Set<string>();
+    for (const sub of subResult.entries) {
+      queuedSubdirFiles.add(sub.filePath);
       if (loadedSubdirSet.has(sub.id) || pendingKeySet.has(sub.id)) continue;
-      const relTriggered = path.relative(absWs, accessedPath).replace(/\\/g, '/');
       state.pendingInjections.push({
         key: sub.id,
         kind: 'subdir_claude_md',
+        scope: 'subdir',
         filePath: sub.filePath,
         displayPath: sub.displayPath,
         workspaceRoot: absWs,
@@ -406,6 +431,25 @@ function handlePostToolUse(
       });
       pendingKeySet.add(sub.id);
       newlyQueuedLabels.push(`subdir:${sub.displayPath}`);
+    }
+    // Also queue a once-per-session notice if a subdir CLAUDE.md was completely blocked (e.g., symlink or import-only)
+    for (const blk of subResult.blocked) {
+      if (blk.status !== 'pending_approval') continue;
+      if (queuedSubdirFiles.has(blk.sourceFile)) continue;
+      const blockedKey = `blocked:${blk.sourceFile}`;
+      if (loadedSubdirSet.has(blockedKey) || pendingKeySet.has(blockedKey)) continue;
+      state.pendingInjections.push({
+        key: blockedKey,
+        kind: 'subdir_claude_md',
+        scope: 'subdir',
+        filePath: blk.sourceFile,
+        displayPath: blk.sourceDisplayPath,
+        workspaceRoot: absWs,
+        triggeredBy: relTriggered,
+        queuedAt: new Date().toISOString(),
+      });
+      pendingKeySet.add(blockedKey);
+      newlyQueuedLabels.push(`blocked-subdir:${blk.sourceDisplayPath}`);
     }
   }
 
@@ -493,32 +537,56 @@ function handlePreInvocation(
     const lazyBlocks: string[] = [];
 
     for (const item of state.pendingInjections) {
+      const trustLoadOpts = {
+        claudeConfigDir: getClaudeConfigDir(process.env),
+        deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd,
+        trustClaudeCodeExternalApprovals: config.trustClaudeCodeExternalApprovals,
+        externalRuleTrust: config.externalRuleTrust,
+      };
       if (item.kind === 'scoped_rule') {
         if (loadedRules.has(item.key)) continue;
-        const entry = loadConditionalRuleContent(
+        const effectiveScope = item.scope ?? 'project_rule';
+        const res = loadConditionalRuleContentWithDiagnostics(
           item.filePath,
           item.workspaceRoot,
-          'project_rule',
-          { deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd },
+          effectiveScope,
+          trustLoadOpts,
         );
         loadedRules.add(item.key);
-        if (entry) {
+        const pendingCount = res.blocked.filter((b) => b.status === 'pending_approval').length;
+        if (res.entry) {
+          const note = pendingCount > 0 ? `\n\n${formatPendingExternalNotice(pendingCount)}` : '';
           lazyBlocks.push(
-            `### ${item.displayPath} (path-scoped rule matched \`${item.triggeredBy}\`)\n${entry.content}`,
+            `### ${item.displayPath} (path-scoped rule matched \`${item.triggeredBy}\`)\n${res.entry.content}${note}`,
           );
           labels.push(`lazy-rule:${item.displayPath}`);
+        } else if (pendingCount > 0) {
+          lazyBlocks.push(
+            `### ${item.displayPath} (path-scoped rule matched \`${item.triggeredBy}\`)\n${formatPendingExternalNotice(pendingCount)}`,
+          );
+          labels.push(`lazy-blocked-rule:${item.displayPath}`);
         }
       } else {
         if (loadedSubdirs.has(item.key)) continue;
-        const entry = loadConditionalRuleContent(item.filePath, item.workspaceRoot, 'subdir', {
-          deduplicateNativeAgentsMd: config.deduplicateNativeAgentsMd,
-        });
+        const res = loadConditionalRuleContentWithDiagnostics(
+          item.filePath,
+          item.workspaceRoot,
+          item.scope ?? 'subdir',
+          trustLoadOpts,
+        );
         loadedSubdirs.add(item.key);
-        if (entry) {
+        const pendingCount = res.blocked.filter((b) => b.status === 'pending_approval').length;
+        if (res.entry) {
+          const note = pendingCount > 0 ? `\n\n${formatPendingExternalNotice(pendingCount)}` : '';
           lazyBlocks.push(
-            `### ${item.displayPath} (subdirectory CLAUDE.md triggered by \`${item.triggeredBy}\`)\n${entry.content}`,
+            `### ${item.displayPath} (subdirectory CLAUDE.md triggered by \`${item.triggeredBy}\`)\n${res.entry.content}${note}`,
           );
           labels.push(`lazy-subdir:${item.displayPath}`);
+        } else if (pendingCount > 0) {
+          lazyBlocks.push(
+            `### ${item.displayPath} (subdirectory CLAUDE.md triggered by \`${item.triggeredBy}\`)\n${formatPendingExternalNotice(pendingCount)}`,
+          );
+          labels.push(`lazy-blocked-subdir:${item.displayPath}`);
         }
       }
     }

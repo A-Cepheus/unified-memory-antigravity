@@ -1,4 +1,7 @@
 import type {
+  ApprovedExternalRuleTarget,
+  BlockedExternalRuleTarget,
+  ClaudeCodeExternalApprovalState,
   ClaudeMemoryIndex,
   ClaudeMemoryTopic,
   ClaudeMemoryType,
@@ -9,6 +12,7 @@ import type {
   CodexSearchHit,
   DiagnosticEvent,
   UnifiedMemoryConfig,
+  WorkspaceExternalTrustConfig,
   WorkspaceRulesBundle,
 } from '../core/types.js';
 
@@ -88,6 +92,8 @@ export interface RulesInspectPayload {
   globalAlwaysOn: ClaudeRuleEntry[];
   globalConditional: ClaudeRuleEntry[];
   workspace: WorkspaceRulesBundle | null;
+  workspaceExternalTrust: WorkspaceExternalTrustConfig;
+  trustClaudeCodeExternalApprovals: boolean;
   recentSessionHits: Array<{
     conversationId: string;
     updatedAt: string;
@@ -103,6 +109,9 @@ export type CallToolFn = <T = Record<string, unknown>>(
 ) => Promise<T>;
 
 export type {
+  ApprovedExternalRuleTarget,
+  BlockedExternalRuleTarget,
+  ClaudeCodeExternalApprovalState,
   ClaudeMemoryIndex,
   ClaudeMemoryTopic,
   ClaudeMemoryType,
@@ -113,4 +122,5 @@ export type {
   CodexSearchHit,
   DiagnosticEvent,
   UnifiedMemoryConfig,
+  WorkspaceExternalTrustConfig,
 };

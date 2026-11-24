@@ -3,10 +3,56 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  ClaudeCodeExternalApprovalState,
   ClaudeMergedSettings,
   ClaudeProjectResolution,
   ClaudeProjectSummary,
 } from '../types.js';
+
+export function canonicalizeFsPath(filePath: string): string {
+  const expanded = expandHome(filePath.trim());
+  const resolved = path.resolve(expanded);
+  try {
+    return fs.realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+export function resolveGitTopLevel(dirPath: string): string | null {
+  const normalized = path.resolve(dirPath);
+  if (!fs.existsSync(normalized)) return null;
+  let targetDir = normalized;
+  try {
+    if (fs.statSync(normalized).isFile()) {
+      targetDir = path.dirname(normalized);
+    }
+  } catch {
+    return null;
+  }
+  try {
+    const topLevel = execFileSync('git', ['-C', targetDir, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      timeout: 1500,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    if (!topLevel) return null;
+    return canonicalizeFsPath(topLevel);
+  } catch {
+    return null;
+  }
+}
+
+export function getClaudeStateFilePath(
+  claudeConfigDir: string = getClaudeConfigDir(),
+  homeDir: string = os.homedir(),
+): string {
+  const defaultConfigDir = path.join(homeDir, '.claude');
+  if (path.resolve(claudeConfigDir) !== path.resolve(defaultConfigDir)) {
+    return path.join(claudeConfigDir, '.claude.json');
+  }
+  return path.join(homeDir, '.claude.json');
+}
 
 export function getClaudeConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   const configured = env.CLAUDE_CONFIG_DIR?.trim();
@@ -226,6 +272,70 @@ export function resolveClaudeProject(
     disabledByEnv: settings.disabledByEnv,
     exists: fs.existsSync(memoryDir),
   };
+}
+
+/**
+ * Reads ONLY Claude Code's per-project external CLAUDE.md include approval booleans
+ * (`hasClaudeMdExternalIncludesApproved`, `hasClaudeMdExternalIncludesWarningShown`)
+ * from `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`).
+ * Strictly read-only; never reads tokens/secrets or modifies `.claude.json`.
+ */
+export function readClaudeCodeExternalApproval(
+  workspaceRoot: string,
+  options?: {
+    claudeConfigDir?: string;
+    homeDir?: string;
+    claudeStateFilePath?: string;
+  },
+): ClaudeCodeExternalApprovalState | null {
+  const homeDir = options?.homeDir ?? os.homedir();
+  const claudeConfigDir = options?.claudeConfigDir ?? getClaudeConfigDir();
+  const statePath =
+    options?.claudeStateFilePath ?? getClaudeStateFilePath(claudeConfigDir, homeDir);
+  const obj = safeReadJsonObject(statePath);
+  if (!obj || !obj.projects || typeof obj.projects !== 'object' || Array.isArray(obj.projects)) {
+    return null;
+  }
+
+  const projects = obj.projects as Record<string, unknown>;
+  const resolvedWs = path.resolve(workspaceRoot);
+  const realWs = canonicalizeFsPath(workspaceRoot);
+
+  const extractState = (
+    projKey: string,
+    entry: unknown,
+  ): ClaudeCodeExternalApprovalState | null => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const rec = entry as Record<string, unknown>;
+    const hasApproved = typeof rec.hasClaudeMdExternalIncludesApproved === 'boolean';
+    const hasWarning = typeof rec.hasClaudeMdExternalIncludesWarningShown === 'boolean';
+    if (!hasApproved && !hasWarning) return null;
+    return {
+      approved: rec.hasClaudeMdExternalIncludesApproved === true,
+      warningShown: rec.hasClaudeMdExternalIncludesWarningShown === true,
+      matchedProjectKey: projKey,
+    };
+  };
+
+  // 1. Direct lookup on resolved path and canonical realpath
+  for (const key of [resolvedWs, realWs]) {
+    if (Object.prototype.hasOwnProperty.call(projects, key)) {
+      const state = extractState(key, projects[key]);
+      if (state) return state;
+    }
+  }
+
+  // 2. Fallback: compare normalized/canonical keys (handles trailing slash or symlinked project key)
+  for (const [projKey, val] of Object.entries(projects)) {
+    if (!projKey.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(projKey)) continue;
+    const normKey = path.resolve(projKey);
+    if (normKey === resolvedWs || normKey === realWs || canonicalizeFsPath(normKey) === realWs) {
+      const state = extractState(projKey, val);
+      if (state) return state;
+    }
+  }
+
+  return null;
 }
 
 /**

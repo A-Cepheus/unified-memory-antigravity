@@ -366,9 +366,236 @@ describe('Built dist/ end-to-end verification (Hook + MCP Server + MCP App UI)',
           codexRes.result as { content: Array<{ text: string }> }
         ).content[0].text;
         assert.ok(codexText.includes('MCP_CODEX_OK'));
+
+        // Verify ui_update_external_trust is strictly app-only (hidden from model!)
+        const trustTool = tools.find((t) => t.name === 'ui_update_external_trust');
+        assert.ok(trustTool, 'ui_update_external_trust tool must be registered');
+        assert.deepEqual(
+          (trustTool._meta?.ui as { visibility?: string[] })?.visibility,
+          ['app'],
+        );
       } finally {
         child.kill();
       }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('blocks unapproved external imports/symlinks in hooks, preserves user_rule lazy scope, and honors UI + ~/.claude.json approvals', async () => {
+    const tmp = mkTempDir('um-e2e-ext-');
+    try {
+      const fakeClaude = path.join(tmp, '.claude');
+      const fakeCodex = path.join(tmp, '.codex');
+      const pluginData = path.join(tmp, 'plugin_data');
+      const extDir = path.join(tmp, 'external');
+      const ws = path.join(tmp, 'target-repo');
+
+      fs.mkdirSync(path.join(fakeClaude, 'rules'), { recursive: true });
+      fs.mkdirSync(fakeCodex, { recursive: true });
+      fs.mkdirSync(extDir, { recursive: true });
+      fs.mkdirSync(path.join(ws, '.claude', 'rules'), { recursive: true });
+      fs.mkdirSync(path.join(ws, 'subpkg'), { recursive: true });
+
+      const styleFile = path.join(extDir, 'style.md');
+      const otherFile = path.join(extDir, 'other.md');
+      fs.writeFileSync(styleFile, 'EXT_STYLE_TOKEN_777\n');
+      fs.writeFileSync(otherFile, 'EXT_OTHER_TOKEN_888\n');
+
+      // User-level path-scoped rule importing external file (MUST be trusted during lazy-load!)
+      fs.writeFileSync(
+        path.join(fakeClaude, 'rules', 'user-ts.md'),
+        `---\npaths:\n  - "subpkg/**/*.ts"\n---\n@${styleFile}\nUSER_SCOPED_TOKEN_666\n`,
+      );
+
+      // Repo rules referencing external files & symlink
+      fs.writeFileSync(
+        path.join(ws, 'CLAUDE.md'),
+        `@${styleFile}\n@${otherFile}\nREPO_SAFE_TOKEN_111\n`,
+      );
+      fs.symlinkSync(otherFile, path.join(ws, '.claude', 'rules', 'ext-link.md'));
+      fs.writeFileSync(path.join(ws, 'subpkg', 'CLAUDE.md'), `@${otherFile}\nSUBPKG_SAFE_222\n`);
+      fs.writeFileSync(path.join(ws, 'subpkg', 'index.ts'), 'export const x = 1;\n');
+
+      const env = {
+        CLAUDE_CONFIG_DIR: fakeClaude,
+        CODEX_HOME: fakeCodex,
+        PLUGIN_DATA: pluginData,
+      };
+
+      // 1. SessionStart blocks unapproved external targets and emits compact notice without leaking paths
+      const s1 = runHook(
+        {
+          hookEventName: 'SessionStart',
+          conversationId: 'conv-ext-1',
+          workspacePaths: [ws],
+          cwd: ws,
+        },
+        env,
+      );
+      const s1Text = (
+        s1.injectSteps as Array<{ systemMessage: { systemMessage: string } }>
+      )[0].systemMessage.systemMessage;
+      assert.ok(s1Text.includes('REPO_SAFE_TOKEN_111'));
+      assert.ok(!s1Text.includes('EXT_STYLE_TOKEN_777'));
+      assert.ok(!s1Text.includes('EXT_OTHER_TOKEN_888'));
+      assert.ok(s1Text.includes('unapproved external rule import(s)/symlink(s)'));
+      assert.ok(!s1Text.includes(styleFile), 'Must not leak host path into model notice');
+
+      // 2. PostToolUse + PreInvocation: user_rule stays trusted while repo subdir stays blocked
+      runHook(
+        {
+          hookEventName: 'PostToolUse',
+          conversationId: 'conv-ext-1',
+          workspacePaths: [ws],
+          toolCall: { name: 'read_file', args: { Path: path.join(ws, 'subpkg', 'index.ts') } },
+        },
+        env,
+      );
+      const pre1 = runHook(
+        {
+          hookEventName: 'PreInvocation',
+          conversationId: 'conv-ext-1',
+          workspacePaths: [ws],
+          invocationNum: 1,
+          initialNumSteps: 3,
+        },
+        env,
+      );
+      const pre1Text = (
+        pre1.injectSteps as Array<{ systemMessage: { systemMessage: string } }>
+      )[0].systemMessage.systemMessage;
+      assert.ok(pre1Text.includes('USER_SCOPED_TOKEN_666'));
+      assert.ok(
+        pre1Text.includes('EXT_STYLE_TOKEN_777'),
+        'User-level path-scoped rule must retain trusted scope during lazy-load',
+      );
+      assert.ok(pre1Text.includes('SUBPKG_SAFE_222'));
+      assert.ok(!pre1Text.includes('EXT_OTHER_TOKEN_888'));
+
+      // 3. Approve ONLY styleFile via app-only MCP tool `ui_update_external_trust`
+      const child = spawn(process.execPath, [MCP_BUNDLE], {
+        env: {
+          ...process.env,
+          PLUGIN_ROOT: REPO_ROOT,
+          PLUGIN_DATA: pluginData,
+          CLAUDE_CONFIG_DIR: fakeClaude,
+          CODEX_HOME: fakeCodex,
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+
+      const responses = new Map<number, Record<string, unknown>>();
+      const waiters = new Map<number, (msg: Record<string, unknown>) => void>();
+      let buf = '';
+      child.stdout.setEncoding('utf8');
+      child.stdout.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl: number;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const msg = JSON.parse(line) as Record<string, unknown>;
+          if (typeof msg.id === 'number') {
+            const w = waiters.get(msg.id);
+            if (w) {
+              waiters.delete(msg.id);
+              w(msg);
+            } else {
+              responses.set(msg.id, msg);
+            }
+          }
+        }
+      });
+      const rpc = (id: number, method: string, params: Record<string, unknown> = {}) => {
+        child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+        return new Promise<Record<string, unknown>>((resolve, reject) => {
+          if (responses.has(id)) {
+            const r = responses.get(id)!;
+            responses.delete(id);
+            resolve(r);
+            return;
+          }
+          const timer = setTimeout(() => reject(new Error(`RPC timeout for ${method}`)), 5000);
+          waiters.set(id, (msg) => {
+            clearTimeout(timer);
+            resolve(msg);
+          });
+        });
+      };
+
+      try {
+        await rpc(1, 'initialize', {
+          protocolVersion: '2025-03-26',
+          capabilities: {},
+          clientInfo: { name: 'test-client', version: '1.0.0' },
+        });
+        child.stdin.write(
+          JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n',
+        );
+
+        const inspectBefore = await rpc(2, 'tools/call', {
+          name: 'claude_rules_inspect',
+          arguments: { workspacePath: ws },
+        });
+        const inspectData = JSON.parse(
+          (inspectBefore.result as { content: Array<{ text: string }> }).content[0].text,
+        ) as { externalTrustSummary: { pendingExternalApprovalCount: number } };
+        assert.ok(inspectData.externalTrustSummary.pendingExternalApprovalCount >= 2);
+
+        await rpc(3, 'tools/call', {
+          name: 'ui_update_external_trust',
+          arguments: { workspacePath: ws, action: 'allow', targetPath: styleFile },
+        });
+      } finally {
+        child.kill();
+      }
+
+      // New SessionStart loads approved styleFile while keeping otherFile blocked
+      const s2 = runHook(
+        {
+          hookEventName: 'SessionStart',
+          conversationId: 'conv-ext-2',
+          workspacePaths: [ws],
+          cwd: ws,
+        },
+        env,
+      );
+      const s2Text = (
+        s2.injectSteps as Array<{ systemMessage: { systemMessage: string } }>
+      )[0].systemMessage.systemMessage;
+      assert.ok(s2Text.includes('EXT_STYLE_TOKEN_777'));
+      assert.ok(!s2Text.includes('EXT_OTHER_TOKEN_888'));
+      assert.ok(s2Text.includes('unapproved external rule import(s)/symlink(s)'));
+
+      // 4. Native Claude Code .claude.json project approval automatically unlocks remaining targets
+      fs.writeFileSync(
+        path.join(fakeClaude, '.claude.json'),
+        JSON.stringify({
+          projects: {
+            [path.resolve(ws)]: {
+              hasClaudeMdExternalIncludesApproved: true,
+              hasClaudeMdExternalIncludesWarningShown: true,
+            },
+          },
+        }),
+      );
+      const s3 = runHook(
+        {
+          hookEventName: 'SessionStart',
+          conversationId: 'conv-ext-3',
+          workspacePaths: [ws],
+          cwd: ws,
+        },
+        env,
+      );
+      const s3Text = (
+        s3.injectSteps as Array<{ systemMessage: { systemMessage: string } }>
+      )[0].systemMessage.systemMessage;
+      assert.ok(s3Text.includes('EXT_STYLE_TOKEN_777'));
+      assert.ok(s3Text.includes('EXT_OTHER_TOKEN_888'));
+      assert.ok(!s3Text.includes('unapproved external rule'));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

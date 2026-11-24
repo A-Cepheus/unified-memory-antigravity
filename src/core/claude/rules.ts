@@ -2,12 +2,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type {
+  ApprovedExternalRuleTarget,
+  BlockedExternalRuleTarget,
+  ClaudeCodeExternalApprovalState,
   ClaudeRuleEntry,
   ClaudeRuleScope,
+  ExternalRuleApprovalSource,
+  ExternalRuleBlockStatus,
+  WorkspaceExternalTrustConfig,
   WorkspaceRulesBundle,
 } from '../types.js';
 import { parseFrontmatter } from './frontmatter.js';
-import { expandHome, getClaudeConfigDir, readClaudeSettings } from './paths.js';
+import {
+  canonicalizeFsPath,
+  expandHome,
+  getClaudeConfigDir,
+  readClaudeCodeExternalApproval,
+  readClaudeSettings,
+  resolveGitTopLevel,
+} from './paths.js';
+import { getWorkspaceExternalTrust } from '../session/state.js';
 
 const MAX_IMPORT_DEPTH = 5;
 
@@ -166,11 +180,185 @@ export function stripHtmlComments(markdown: string): string {
 }
 
 function safeRealpath(filePath: string): string {
-  try {
-    return fs.realpathSync(filePath);
-  } catch {
-    return path.resolve(filePath);
+  return canonicalizeFsPath(filePath);
+}
+
+/**
+ * User-level and managed rules are authored/controlled by the local user or machine admin
+ * and are trusted for external `@import`s and symlinks (matching standard Claude Code CLI).
+ * Repository-provided rules (`project`, `project_rule`, `local`, `subdir`, `ancestor`)
+ * must be checked against workspace trust boundaries.
+ */
+export function isTrustedRuleScope(scope: ClaudeRuleScope): boolean {
+  return scope === 'managed' || scope === 'user' || scope === 'user_rule';
+}
+
+export function isPathWithinRoot(targetPath: string, rootPath: string): boolean {
+  const rel = path.relative(rootPath, targetPath);
+  if (rel === '') return true;
+  if (rel === '..' || rel.startsWith(`..${path.sep}`) || rel.startsWith('../')) {
+    return false;
   }
+  if (path.isAbsolute(rel)) return false;
+  return true;
+}
+
+export interface RuleExternalTrustOptions {
+  claudeConfigDir?: string;
+  homeDir?: string;
+  claudeStateFilePath?: string;
+  trustClaudeCodeExternalApprovals?: boolean;
+  externalRuleTrust?: Record<string, WorkspaceExternalTrustConfig>;
+}
+
+export interface ExternalRuleTrustContext {
+  workspaceRealRoot: string;
+  allowedRoots: string[];
+  allowPaths: string[];
+  denyPaths: string[];
+  trustClaudeCodeExternalApprovals: boolean;
+  claudeCodeApproval: ClaudeCodeExternalApprovalState | null;
+}
+
+export type TargetAuthorizationDecision =
+  | { allowed: true; internal: true }
+  | { allowed: true; internal: false; approvedBy: ExternalRuleApprovalSource }
+  | { allowed: false; status: ExternalRuleBlockStatus };
+
+export function buildWorkspaceTrustContext(
+  workspaceRoot: string,
+  options?: RuleExternalTrustOptions,
+): ExternalRuleTrustContext {
+  const workspaceRealRoot = safeRealpath(workspaceRoot);
+  const wsTrust = getWorkspaceExternalTrust(options?.externalRuleTrust, workspaceRoot);
+  const claudeCodeApproval = readClaudeCodeExternalApproval(workspaceRoot, {
+    claudeConfigDir: options?.claudeConfigDir,
+    homeDir: options?.homeDir,
+    claudeStateFilePath: options?.claudeStateFilePath,
+  });
+  return {
+    workspaceRealRoot,
+    allowedRoots: [workspaceRealRoot],
+    allowPaths: wsTrust.allowPaths,
+    denyPaths: wsTrust.denyPaths,
+    trustClaudeCodeExternalApprovals: options?.trustClaudeCodeExternalApprovals ?? true,
+    claudeCodeApproval,
+  };
+}
+
+/**
+ * Evaluates whether a canonical target path is permitted for a repository-provided rule.
+ * Precedence:
+ * 1. Inside allowed root(s) -> internal (allowed)
+ * 2. Plugin explicit allow/deny (most specific matching path wins; deny wins on tie)
+ * 3. Native Claude Code ~/.claude.json project-level approval/denial (read-only, if enabled)
+ * 4. Default fail-closed -> pending_approval
+ */
+export function evaluateExternalTargetTrust(
+  targetRealPath: string,
+  trustCtx: ExternalRuleTrustContext,
+): TargetAuthorizationDecision {
+  for (const root of trustCtx.allowedRoots) {
+    if (isPathWithinRoot(targetRealPath, root)) {
+      return { allowed: true, internal: true };
+    }
+  }
+
+  let bestDenyLen = -1;
+  for (const denied of trustCtx.denyPaths) {
+    if (isPathWithinRoot(targetRealPath, denied) && denied.length > bestDenyLen) {
+      bestDenyLen = denied.length;
+    }
+  }
+
+  let bestAllowPath: string | null = null;
+  let bestAllowLen = -1;
+  for (const allowed of trustCtx.allowPaths) {
+    if (isPathWithinRoot(targetRealPath, allowed) && allowed.length > bestAllowLen) {
+      bestAllowLen = allowed.length;
+      bestAllowPath = allowed;
+    }
+  }
+
+  if (bestDenyLen >= 0 || bestAllowLen >= 0) {
+    if (bestAllowLen > bestDenyLen && bestAllowPath !== null) {
+      return {
+        allowed: true,
+        internal: false,
+        approvedBy:
+          targetRealPath === bestAllowPath ? 'plugin_file_allowlist' : 'plugin_dir_allowlist',
+      };
+    }
+    return { allowed: false, status: 'denied_by_plugin' };
+  }
+
+  if (trustCtx.trustClaudeCodeExternalApprovals && trustCtx.claudeCodeApproval) {
+    if (trustCtx.claudeCodeApproval.approved) {
+      return {
+        allowed: true,
+        internal: false,
+        approvedBy: 'claude_code_project_approval',
+      };
+    }
+    if (trustCtx.claudeCodeApproval.warningShown) {
+      return { allowed: false, status: 'denied_by_claude_code' };
+    }
+  }
+
+  return { allowed: false, status: 'pending_approval' };
+}
+
+function formatDisplayPath(filePath: string, workspaceRoot?: string): string {
+  if (workspaceRoot) {
+    const rel = path.relative(workspaceRoot, filePath);
+    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+      return rel.replace(/\\/g, '/');
+    }
+    if (rel === '') return path.basename(filePath);
+  }
+  const home = os.homedir();
+  if (filePath === home || filePath.startsWith(home + path.sep)) {
+    return '~' + filePath.slice(home.length);
+  }
+  return filePath;
+}
+
+function dedupeBlockedTargets(items: BlockedExternalRuleTarget[]): BlockedExternalRuleTarget[] {
+  const seen = new Set<string>();
+  const out: BlockedExternalRuleTarget[] = [];
+  for (const item of items) {
+    const key = `${item.kind}|${item.sourceFile}|${item.rawRef ?? ''}|${item.resolvedTarget}|${item.status}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  out.sort(
+    (a, b) =>
+      a.sourceDisplayPath.localeCompare(b.sourceDisplayPath) ||
+      a.resolvedTarget.localeCompare(b.resolvedTarget) ||
+      a.kind.localeCompare(b.kind),
+  );
+  return out;
+}
+
+function dedupeApprovedTargets(
+  items: ApprovedExternalRuleTarget[],
+): ApprovedExternalRuleTarget[] {
+  const seen = new Set<string>();
+  const out: ApprovedExternalRuleTarget[] = [];
+  for (const item of items) {
+    const key = `${item.kind}|${item.sourceDisplayPath}|${item.resolvedTarget}|${item.approvedBy}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  out.sort(
+    (a, b) =>
+      a.sourceDisplayPath.localeCompare(b.sourceDisplayPath) ||
+      a.resolvedTarget.localeCompare(b.resolvedTarget) ||
+      a.kind.localeCompare(b.kind),
+  );
+  return out;
 }
 
 function isNativeAntigravityRuleInWorkspace(
@@ -181,7 +369,7 @@ function isNativeAntigravityRuleInWorkspace(
   if (base !== 'AGENTS.md' && base !== 'GEMINI.md') return false;
   for (const ws of workspaceRoots) {
     const normWs = safeRealpath(ws);
-    if (resolvedPath === normWs || resolvedPath.startsWith(normWs + path.sep)) {
+    if (isPathWithinRoot(resolvedPath, normWs)) {
       return true;
     }
   }
@@ -192,28 +380,39 @@ export interface ExpandImportsResult {
   content: string;
   imports: string[];
   skippedDuplicateAgentsMd: string[];
+  blockedExternalTargets: BlockedExternalRuleTarget[];
+  approvedExternalTargets: ApprovedExternalRuleTarget[];
 }
 
 /**
  * Expands Claude Code `@path` / `@import path` references recursively up to 5 hops,
- * skipping fenced code blocks and inline backticks, with cycle detection and
- * optional deduplication against native workspace `AGENTS.md` / `GEMINI.md`.
+ * skipping fenced code blocks and inline backticks, with cycle detection,
+ * optional workspace external-trust enforcement, and optional deduplication against
+ * native workspace `AGENTS.md` / `GEMINI.md`.
  */
 export function expandAtImports(
   rawContent: string,
   sourceFilePath: string,
   options?: {
+    workspaceRoot?: string;
     workspaceRoots?: string[];
     deduplicateNativeAgentsMd?: boolean;
     maxDepth?: number;
+    externalTrust?: ExternalRuleTrustContext;
+    sourceScope?: ClaudeRuleScope;
   },
 ): ExpandImportsResult {
+  const workspaceRoot = options?.workspaceRoot;
   const workspaceRoots = options?.workspaceRoots ?? [];
   const deduplicateNativeAgentsMd = options?.deduplicateNativeAgentsMd ?? true;
   const maxDepth = options?.maxDepth ?? MAX_IMPORT_DEPTH;
+  const externalTrust = options?.externalTrust;
+  const sourceScope: ClaudeRuleScope = options?.sourceScope ?? 'project';
 
   const imports: string[] = [];
   const skippedDuplicateAgentsMd: string[] = [];
+  const blockedExternalTargets: BlockedExternalRuleTarget[] = [];
+  const approvedExternalTargets: ApprovedExternalRuleTarget[] = [];
 
   function processText(content: string, currentFile: string, depth: number, stack: Set<string>): string {
     const lines = content.replace(/\r\n/g, '\n').split('\n');
@@ -278,6 +477,35 @@ export function expandAtImports(
         continue; // cycle protection
       }
 
+      if (externalTrust) {
+        const decision = evaluateExternalTargetTrust(realTarget, externalTrust);
+        const curDisplay = formatDisplayPath(currentFile, workspaceRoot);
+        if (!decision.allowed) {
+          blockedExternalTargets.push({
+            kind: 'external_import',
+            sourceFile: path.resolve(currentFile),
+            sourceDisplayPath: curDisplay,
+            sourceScope,
+            rawRef,
+            resolvedTarget: realTarget,
+            targetIsDir: false,
+            status: decision.status,
+          });
+          out.push(
+            `<!-- [unified-memory] skipped untrusted external @${rawRef} (${decision.status}) -->`,
+          );
+          continue;
+        }
+        if (!decision.internal) {
+          approvedExternalTargets.push({
+            kind: 'external_import',
+            sourceDisplayPath: curDisplay,
+            resolvedTarget: realTarget,
+            approvedBy: decision.approvedBy,
+          });
+        }
+      }
+
       if (deduplicateNativeAgentsMd && isNativeAntigravityRuleInWorkspace(realTarget, workspaceRoots)) {
         skippedDuplicateAgentsMd.push(realTarget);
         out.push(
@@ -301,17 +529,87 @@ export function expandAtImports(
   const initialStack = new Set<string>([rootReal]);
   const content = processText(rawContent, sourceFilePath, 0, initialStack);
 
-  return { content, imports, skippedDuplicateAgentsMd };
+  return {
+    content,
+    imports,
+    skippedDuplicateAgentsMd,
+    blockedExternalTargets: dedupeBlockedTargets(blockedExternalTargets),
+    approvedExternalTargets: dedupeApprovedTargets(approvedExternalTargets),
+  };
+}
+
+export interface WalkRulesResult {
+  files: Array<{ filePath: string; approvedExternal?: ApprovedExternalRuleTarget }>;
+  blocked: BlockedExternalRuleTarget[];
+  approvedDirs: ApprovedExternalRuleTarget[];
+  excludedPaths: string[];
 }
 
 /**
  * Recursively discovers `.md` files under a `.claude/rules/` directory,
- * following symlinks with circular-symlink protection.
+ * following symlinks with circular-symlink protection and optional workspace
+ * external-trust enforcement BEFORE traversing symlinked external directories.
  */
-export function walkRulesDirectory(rulesDir: string): string[] {
-  if (!fs.existsSync(rulesDir)) return [];
+export function walkRulesDirectoryWithTrust(
+  rulesDir: string,
+  options?: {
+    workspaceRoot?: string;
+    excludes?: string[];
+    externalTrust?: ExternalRuleTrustContext;
+    sourceScope?: ClaudeRuleScope;
+  },
+): WalkRulesResult {
+  const files: Array<{ filePath: string; approvedExternal?: ApprovedExternalRuleTarget }> = [];
+  const blocked: BlockedExternalRuleTarget[] = [];
+  const approvedDirs: ApprovedExternalRuleTarget[] = [];
+  const excludedPaths: string[] = [];
+
+  if (!fs.existsSync(rulesDir)) {
+    return { files, blocked, approvedDirs, excludedPaths };
+  }
+
+  const workspaceRoot = options?.workspaceRoot;
+  const excludes = options?.excludes ?? [];
+  const externalTrust = options?.externalTrust;
+  const sourceScope: ClaudeRuleScope = options?.sourceScope ?? 'project_rule';
+
+  // Check rulesDir itself before reading/traversing in case `.claude/rules` is an external symlink
+  if (externalTrust) {
+    let rootStat: fs.Stats;
+    try {
+      rootStat = fs.statSync(rulesDir);
+      if (!rootStat.isDirectory()) {
+        return { files, blocked, approvedDirs, excludedPaths };
+      }
+    } catch {
+      return { files, blocked, approvedDirs, excludedPaths };
+    }
+    const realRootDir = safeRealpath(rulesDir);
+    const rootDecision = evaluateExternalTargetTrust(realRootDir, externalTrust);
+    const rootDisplay = formatDisplayPath(rulesDir, workspaceRoot);
+    if (!rootDecision.allowed) {
+      blocked.push({
+        kind: 'external_rule_dir_symlink',
+        sourceFile: path.resolve(rulesDir),
+        sourceDisplayPath: rootDisplay,
+        sourceScope,
+        resolvedTarget: realRootDir,
+        targetIsDir: true,
+        status: rootDecision.status,
+      });
+      return { files, blocked: dedupeBlockedTargets(blocked), approvedDirs, excludedPaths };
+    }
+    if (!rootDecision.internal) {
+      approvedDirs.push({
+        kind: 'external_rule_dir_symlink',
+        sourceDisplayPath: rootDisplay,
+        resolvedTarget: realRootDir,
+        approvedBy: rootDecision.approvedBy,
+      });
+    }
+  }
+
   const visitedDirs = new Set<string>();
-  const files: string[] = [];
 
   function visit(dir: string): void {
     const realDir = safeRealpath(dir);
@@ -329,6 +627,11 @@ export function walkRulesDirectory(rulesDir: string): string[] {
 
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
+      if (excludes.length > 0 && isExcludedPath(fullPath, workspaceRoot, excludes)) {
+        excludedPaths.push(fullPath);
+        continue;
+      }
+
       let stat: fs.Stats;
       try {
         stat = fs.statSync(fullPath); // follows symlinks
@@ -336,16 +639,82 @@ export function walkRulesDirectory(rulesDir: string): string[] {
         continue; // broken symlink
       }
 
+      const realTarget = safeRealpath(fullPath);
+      const displayPath = formatDisplayPath(fullPath, workspaceRoot);
+
       if (stat.isDirectory()) {
+        if (externalTrust) {
+          const decision = evaluateExternalTargetTrust(realTarget, externalTrust);
+          if (!decision.allowed) {
+            blocked.push({
+              kind: 'external_rule_dir_symlink',
+              sourceFile: path.resolve(fullPath),
+              sourceDisplayPath: displayPath,
+              sourceScope,
+              resolvedTarget: realTarget,
+              targetIsDir: true,
+              status: decision.status,
+            });
+            continue; // DO NOT recurse into untrusted external directory
+          }
+          if (!decision.internal) {
+            approvedDirs.push({
+              kind: 'external_rule_dir_symlink',
+              sourceDisplayPath: displayPath,
+              resolvedTarget: realTarget,
+              approvedBy: decision.approvedBy,
+            });
+          }
+        }
         visit(fullPath);
       } else if (stat.isFile() && entry.name.endsWith('.md')) {
-        files.push(fullPath);
+        if (externalTrust) {
+          const decision = evaluateExternalTargetTrust(realTarget, externalTrust);
+          if (!decision.allowed) {
+            blocked.push({
+              kind: 'external_rule_symlink',
+              sourceFile: path.resolve(fullPath),
+              sourceDisplayPath: displayPath,
+              sourceScope,
+              resolvedTarget: realTarget,
+              targetIsDir: false,
+              status: decision.status,
+            });
+            continue;
+          }
+          if (!decision.internal) {
+            files.push({
+              filePath: fullPath,
+              approvedExternal: {
+                kind: 'external_rule_symlink',
+                sourceDisplayPath: displayPath,
+                resolvedTarget: realTarget,
+                approvedBy: decision.approvedBy,
+              },
+            });
+            continue;
+          }
+        }
+        files.push({ filePath: fullPath });
       }
     }
   }
 
   visit(rulesDir);
-  return files;
+  return {
+    files,
+    blocked: dedupeBlockedTargets(blocked),
+    approvedDirs: dedupeApprovedTargets(approvedDirs),
+    excludedPaths,
+  };
+}
+
+/**
+ * Recursively discovers `.md` files under a `.claude/rules/` directory,
+ * following symlinks with circular-symlink protection.
+ */
+export function walkRulesDirectory(rulesDir: string): string[] {
+  return walkRulesDirectoryWithTrust(rulesDir).files.map((f) => f.filePath);
 }
 
 function isExcludedPath(
@@ -364,7 +733,13 @@ function isExcludedPath(
   return candidates.some((c) => matchesGlobPatterns(c, excludes));
 }
 
-function loadSingleRuleFile(
+export interface SingleRuleLoadResult {
+  entry: ClaudeRuleEntry | null;
+  blocked: BlockedExternalRuleTarget[];
+  approved: ApprovedExternalRuleTarget[];
+}
+
+function loadSingleRuleFileWithDiagnostics(
   filePath: string,
   scope: ClaudeRuleScope,
   options: {
@@ -372,18 +747,57 @@ function loadSingleRuleFile(
     workspaceRoots: string[];
     deduplicateNativeAgentsMd: boolean;
     parsePathsFrontmatter: boolean;
+    fileTrustCtx?: ExternalRuleTrustContext;
+    importTrustCtx?: ExternalRuleTrustContext;
   },
-): ClaudeRuleEntry | null {
-  if (!fs.existsSync(filePath)) return null;
+): SingleRuleLoadResult {
+  if (!fs.existsSync(filePath)) {
+    return { entry: null, blocked: [], approved: [] };
+  }
   let st: fs.Stats;
   try {
     st = fs.statSync(filePath);
-    if (!st.isFile()) return null;
+    if (!st.isFile()) {
+      return { entry: null, blocked: [], approved: [] };
+    }
   } catch {
-    return null;
+    return { entry: null, blocked: [], approved: [] };
   }
 
-  const raw = fs.readFileSync(filePath, 'utf8');
+  const realFilePath = safeRealpath(filePath);
+  const displayPath = formatDisplayPath(filePath, options.workspaceRoot);
+  const approved: ApprovedExternalRuleTarget[] = [];
+
+  if (!isTrustedRuleScope(scope) && options.fileTrustCtx) {
+    const decision = evaluateExternalTargetTrust(realFilePath, options.fileTrustCtx);
+    if (!decision.allowed) {
+      return {
+        entry: null,
+        blocked: [
+          {
+            kind: 'external_rule_symlink',
+            sourceFile: path.resolve(filePath),
+            sourceDisplayPath: displayPath,
+            sourceScope: scope,
+            resolvedTarget: realFilePath,
+            targetIsDir: false,
+            status: decision.status,
+          },
+        ],
+        approved: [],
+      };
+    }
+    if (!decision.internal) {
+      approved.push({
+        kind: 'external_rule_symlink',
+        sourceDisplayPath: displayPath,
+        resolvedTarget: realFilePath,
+        approvedBy: decision.approvedBy,
+      });
+    }
+  }
+
+  const raw = fs.readFileSync(realFilePath, 'utf8');
   let body = raw;
   let pathsList: string[] | null = null;
 
@@ -408,29 +822,40 @@ function loadSingleRuleFile(
   }
 
   const expanded = expandAtImports(body, filePath, {
+    workspaceRoot: options.workspaceRoot,
     workspaceRoots: options.workspaceRoots,
     deduplicateNativeAgentsMd: options.deduplicateNativeAgentsMd,
+    externalTrust: isTrustedRuleScope(scope) ? undefined : options.importTrustCtx,
+    sourceScope: scope,
   });
-  const cleaned = stripHtmlComments(expanded.content);
-  if (!cleaned.trim()) return null;
 
-  const displayPath = options.workspaceRoot
-    ? path.relative(options.workspaceRoot, filePath) || path.basename(filePath)
-    : filePath.replace(os.homedir(), '~');
+  const allBlocked = dedupeBlockedTargets(expanded.blockedExternalTargets);
+  const allApproved = dedupeApprovedTargets([...approved, ...expanded.approvedExternalTargets]);
+
+  const cleaned = stripHtmlComments(expanded.content);
+  if (!cleaned.trim()) {
+    return { entry: null, blocked: allBlocked, approved: allApproved };
+  }
 
   return {
-    id: safeRealpath(filePath),
-    filePath: path.resolve(filePath),
-    displayPath,
-    scope,
-    workspaceRoot: options.workspaceRoot,
-    paths: pathsList,
-    isConditional: pathsList !== null && pathsList.length > 0,
-    content: cleaned,
-    imports: expanded.imports,
-    skippedDuplicateAgentsMd: expanded.skippedDuplicateAgentsMd,
-    sizeBytes: Buffer.byteLength(cleaned, 'utf8'),
-    mtimeMs: st.mtimeMs,
+    entry: {
+      id: realFilePath,
+      filePath: path.resolve(filePath),
+      displayPath,
+      scope,
+      workspaceRoot: options.workspaceRoot,
+      paths: pathsList,
+      isConditional: pathsList !== null && pathsList.length > 0,
+      content: cleaned,
+      imports: expanded.imports,
+      skippedDuplicateAgentsMd: expanded.skippedDuplicateAgentsMd,
+      blockedExternalTargets: allBlocked,
+      approvedExternalTargets: allApproved,
+      sizeBytes: Buffer.byteLength(cleaned, 'utf8'),
+      mtimeMs: st.mtimeMs,
+    },
+    blocked: allBlocked,
+    approved: allApproved,
   };
 }
 
@@ -447,11 +872,12 @@ export function getManagedClaudeMdPath(platform: NodeJS.Platform = process.platf
 /**
  * Loads global (managed + user) and per-workspace CLAUDE.md + `.claude/rules/`
  * in exact Claude Code precedence order (broadest -> narrowest).
+ * User/managed rules are trusted by default; repository-provided rules enforce
+ * workspace boundary checks for external `@import`s and rule symlinks.
  */
 export function loadClaudeRulesForWorkspaces(
   workspacePaths: string[],
-  options?: {
-    claudeConfigDir?: string;
+  options?: RuleExternalTrustOptions & {
     deduplicateNativeAgentsMd?: boolean;
     platform?: NodeJS.Platform;
   },
@@ -461,6 +887,8 @@ export function loadClaudeRulesForWorkspaces(
   workspaces: WorkspaceRulesBundle[];
 } {
   const claudeConfigDir = options?.claudeConfigDir ?? getClaudeConfigDir();
+  const homeDir = options?.homeDir ?? os.homedir();
+  const homeReal = safeRealpath(homeDir);
   const deduplicateNativeAgentsMd = options?.deduplicateNativeAgentsMd ?? true;
   const seenGlobalIds = new Set<string>();
   const globalAlwaysOn: ClaudeRuleEntry[] = [];
@@ -479,40 +907,40 @@ export function loadClaudeRulesForWorkspaces(
     }
   };
 
-  // 1. Managed CLAUDE.md
+  // 1. Managed CLAUDE.md (trusted)
   const managedPath = getManagedClaudeMdPath(options?.platform);
   if (!isExcludedPath(managedPath, undefined, globalExcludes)) {
     pushGlobal(
-      loadSingleRuleFile(managedPath, 'managed', {
+      loadSingleRuleFileWithDiagnostics(managedPath, 'managed', {
         workspaceRoots: workspacePaths,
         deduplicateNativeAgentsMd,
         parsePathsFrontmatter: false,
-      }),
+      }).entry,
     );
   }
 
-  // 2. User ~/.claude/CLAUDE.md
+  // 2. User ~/.claude/CLAUDE.md (trusted)
   const userClaudeMd = path.join(claudeConfigDir, 'CLAUDE.md');
   if (!isExcludedPath(userClaudeMd, undefined, globalExcludes)) {
     pushGlobal(
-      loadSingleRuleFile(userClaudeMd, 'user', {
+      loadSingleRuleFileWithDiagnostics(userClaudeMd, 'user', {
         workspaceRoots: workspacePaths,
         deduplicateNativeAgentsMd,
         parsePathsFrontmatter: false,
-      }),
+      }).entry,
     );
   }
 
-  // 3. User ~/.claude/rules/**/*.md
+  // 3. User ~/.claude/rules/**/*.md (trusted)
   const userRulesDir = path.join(claudeConfigDir, 'rules');
   for (const ruleFile of walkRulesDirectory(userRulesDir)) {
     if (isExcludedPath(ruleFile, undefined, globalExcludes)) continue;
     pushGlobal(
-      loadSingleRuleFile(ruleFile, 'user_rule', {
+      loadSingleRuleFileWithDiagnostics(ruleFile, 'user_rule', {
         workspaceRoots: workspacePaths,
         deduplicateNativeAgentsMd,
         parsePathsFrontmatter: true,
-      }),
+      }).entry,
     );
   }
 
@@ -528,23 +956,44 @@ export function loadClaudeRulesForWorkspaces(
     const alwaysOn: ClaudeRuleEntry[] = [];
     const conditional: ClaudeRuleEntry[] = [];
     const excludedPaths: string[] = [];
+    const wsBlocked: BlockedExternalRuleTarget[] = [];
+    const wsApproved: ApprovedExternalRuleTarget[] = [];
+
+    const wsTrustCtx = buildWorkspaceTrustContext(wsRoot, {
+      claudeConfigDir,
+      homeDir,
+      claudeStateFilePath: options?.claudeStateFilePath,
+      trustClaudeCodeExternalApprovals: options?.trustClaudeCodeExternalApprovals,
+      externalRuleTrust: options?.externalRuleTrust,
+    });
+    const gitTopLevel = resolveGitTopLevel(wsRoot);
 
     const addWsEntry = (
       filePath: string,
       scope: ClaudeRuleScope,
       parsePathsFrontmatter: boolean,
+      trustOverride?: {
+        fileTrustCtx: ExternalRuleTrustContext;
+        importTrustCtx: ExternalRuleTrustContext;
+      },
     ) => {
       if (!fs.existsSync(filePath)) return;
       if (isExcludedPath(filePath, wsRoot, excludes)) {
         excludedPaths.push(filePath);
         return;
       }
-      const entry = loadSingleRuleFile(filePath, scope, {
+      const res = loadSingleRuleFileWithDiagnostics(filePath, scope, {
         workspaceRoot: wsRoot,
-        workspaceRoots: workspacePaths,
+        workspaceRoots: [wsRoot],
         deduplicateNativeAgentsMd,
         parsePathsFrontmatter,
+        fileTrustCtx: trustOverride?.fileTrustCtx ?? wsTrustCtx,
+        importTrustCtx: trustOverride?.importTrustCtx ?? wsTrustCtx,
       });
+      if (res.blocked.length > 0) wsBlocked.push(...res.blocked);
+      if (res.approved.length > 0) wsApproved.push(...res.approved);
+
+      const entry = res.entry;
       if (!entry || seenWs.has(entry.id)) return;
       seenWs.add(entry.id);
       if (entry.isConditional) {
@@ -561,15 +1010,33 @@ export function loadClaudeRulesForWorkspaces(
       ancestors.unshift(cur);
       cur = path.dirname(cur);
     }
-    const homeDir = os.homedir();
     for (const anc of ancestors) {
+      const ancReal = safeRealpath(anc);
+      const inSameGitRepo =
+        gitTopLevel !== null &&
+        gitTopLevel !== path.parse(gitTopLevel).root &&
+        gitTopLevel !== homeReal &&
+        isPathWithinRoot(ancReal, gitTopLevel);
+
+      const ancImportTrust: ExternalRuleTrustContext = inSameGitRepo
+        ? {
+            ...wsTrustCtx,
+            allowedRoots: Array.from(new Set([wsTrustCtx.workspaceRealRoot, gitTopLevel])),
+          }
+        : wsTrustCtx;
+      const ancFileTrust: ExternalRuleTrustContext = {
+        ...ancImportTrust,
+        allowedRoots: Array.from(new Set([...ancImportTrust.allowedRoots, ancReal])),
+      };
+      const ancOverride = { fileTrustCtx: ancFileTrust, importTrustCtx: ancImportTrust };
+
       // Avoid re-loading ~/.claude/CLAUDE.md as ancestor when walking through home
-      if (anc === homeDir) {
-        addWsEntry(path.join(anc, 'CLAUDE.md'), 'ancestor', false);
+      if (anc === homeDir || ancReal === homeReal) {
+        addWsEntry(path.join(anc, 'CLAUDE.md'), 'ancestor', false, ancOverride);
         continue;
       }
-      addWsEntry(path.join(anc, 'CLAUDE.md'), 'ancestor', false);
-      addWsEntry(path.join(anc, '.claude', 'CLAUDE.md'), 'ancestor', false);
+      addWsEntry(path.join(anc, 'CLAUDE.md'), 'ancestor', false, ancOverride);
+      addWsEntry(path.join(anc, '.claude', 'CLAUDE.md'), 'ancestor', false, ancOverride);
     }
 
     // Project root CLAUDE.md -> .claude/CLAUDE.md -> .claude/rules/**/*.md -> CLAUDE.local.md
@@ -577,8 +1044,17 @@ export function loadClaudeRulesForWorkspaces(
     addWsEntry(path.join(wsRoot, '.claude', 'CLAUDE.md'), 'project', false);
 
     const projRulesDir = path.join(wsRoot, '.claude', 'rules');
-    for (const ruleFile of walkRulesDirectory(projRulesDir)) {
-      addWsEntry(ruleFile, 'project_rule', true);
+    const walked = walkRulesDirectoryWithTrust(projRulesDir, {
+      workspaceRoot: wsRoot,
+      excludes,
+      externalTrust: wsTrustCtx,
+      sourceScope: 'project_rule',
+    });
+    if (walked.excludedPaths.length > 0) excludedPaths.push(...walked.excludedPaths);
+    if (walked.blocked.length > 0) wsBlocked.push(...walked.blocked);
+    if (walked.approvedDirs.length > 0) wsApproved.push(...walked.approvedDirs);
+    for (const item of walked.files) {
+      addWsEntry(item.filePath, 'project_rule', true);
     }
 
     addWsEntry(path.join(wsRoot, 'CLAUDE.local.md'), 'local', false);
@@ -588,33 +1064,43 @@ export function loadClaudeRulesForWorkspaces(
       alwaysOn,
       conditional,
       excludedPaths,
+      blockedExternalTargets: dedupeBlockedTargets(wsBlocked),
+      approvedExternalTargets: dedupeApprovedTargets(wsApproved),
+      claudeCodeExternalApproval: wsTrustCtx.claudeCodeApproval,
     });
   }
 
   return { globalAlwaysOn, globalConditional, workspaces };
 }
 
+export interface SubdirRulesDiscoveryResult {
+  entries: ClaudeRuleEntry[];
+  blocked: BlockedExternalRuleTarget[];
+  approved: ApprovedExternalRuleTarget[];
+}
+
 /**
  * Discovers lazy-loaded subdirectory CLAUDE.md files between an accessed file's
- * parent directory and its containing workspaceRoot (exclusive of workspaceRoot itself).
+ * parent directory and its containing workspaceRoot (exclusive of workspaceRoot itself),
+ * returning both loaded entries and any blocked/approved external target diagnostics.
  */
-export function findSubdirectoryClaudeMds(
+export function findSubdirectoryClaudeMdsWithDiagnostics(
   accessedFilePath: string,
   workspaceRoot: string,
-  options?: {
-    claudeConfigDir?: string;
+  options?: RuleExternalTrustOptions & {
     deduplicateNativeAgentsMd?: boolean;
   },
-): ClaudeRuleEntry[] {
+): SubdirRulesDiscoveryResult {
   const absFile = path.resolve(accessedFilePath);
   const absWs = path.resolve(workspaceRoot);
   if (absFile !== absWs && !absFile.startsWith(absWs + path.sep)) {
-    return [];
+    return { entries: [], blocked: [], approved: [] };
   }
 
   const claudeConfigDir = options?.claudeConfigDir ?? getClaudeConfigDir();
   const wsSettings = readClaudeSettings(absWs, claudeConfigDir);
   const excludes = wsSettings.claudeMdExcludes;
+  const wsTrustCtx = buildWorkspaceTrustContext(absWs, options);
 
   const dirs: string[] = [];
   let cur = path.dirname(absFile);
@@ -625,7 +1111,9 @@ export function findSubdirectoryClaudeMds(
     cur = parent;
   }
 
-  const results: ClaudeRuleEntry[] = [];
+  const entries: ClaudeRuleEntry[] = [];
+  const blocked: BlockedExternalRuleTarget[] = [];
+  const approved: ApprovedExternalRuleTarget[] = [];
   const seen = new Set<string>();
   for (const dir of dirs) {
     for (const candidate of [
@@ -635,32 +1123,73 @@ export function findSubdirectoryClaudeMds(
     ]) {
       if (!fs.existsSync(candidate)) continue;
       if (isExcludedPath(candidate, absWs, excludes)) continue;
-      const entry = loadSingleRuleFile(candidate, 'subdir', {
+      const res = loadSingleRuleFileWithDiagnostics(candidate, 'subdir', {
         workspaceRoot: absWs,
         workspaceRoots: [absWs],
         deduplicateNativeAgentsMd: options?.deduplicateNativeAgentsMd ?? true,
         parsePathsFrontmatter: false,
+        fileTrustCtx: wsTrustCtx,
+        importTrustCtx: wsTrustCtx,
       });
-      if (entry && !seen.has(entry.id)) {
-        seen.add(entry.id);
-        results.push(entry);
+      if (res.blocked.length > 0) blocked.push(...res.blocked);
+      if (res.approved.length > 0) approved.push(...res.approved);
+      if (res.entry && !seen.has(res.entry.id)) {
+        seen.add(res.entry.id);
+        entries.push(res.entry);
       }
     }
   }
 
-  return results;
+  return {
+    entries,
+    blocked: dedupeBlockedTargets(blocked),
+    approved: dedupeApprovedTargets(approved),
+  };
+}
+
+/**
+ * Discovers lazy-loaded subdirectory CLAUDE.md files between an accessed file's
+ * parent directory and its containing workspaceRoot (exclusive of workspaceRoot itself).
+ */
+export function findSubdirectoryClaudeMds(
+  accessedFilePath: string,
+  workspaceRoot: string,
+  options?: RuleExternalTrustOptions & {
+    deduplicateNativeAgentsMd?: boolean;
+  },
+): ClaudeRuleEntry[] {
+  return findSubdirectoryClaudeMdsWithDiagnostics(accessedFilePath, workspaceRoot, options).entries;
+}
+
+export function loadConditionalRuleContentWithDiagnostics(
+  ruleFilePath: string,
+  workspaceRoot: string,
+  scope: ClaudeRuleScope,
+  options?: RuleExternalTrustOptions & {
+    deduplicateNativeAgentsMd?: boolean;
+  },
+): SingleRuleLoadResult {
+  const trusted = isTrustedRuleScope(scope);
+  const wsTrustCtx = trusted ? undefined : buildWorkspaceTrustContext(workspaceRoot, options);
+  const parsePathsFrontmatter = scope === 'project_rule' || scope === 'user_rule';
+  return loadSingleRuleFileWithDiagnostics(ruleFilePath, scope, {
+    workspaceRoot: trusted ? undefined : workspaceRoot,
+    workspaceRoots: [workspaceRoot],
+    deduplicateNativeAgentsMd: options?.deduplicateNativeAgentsMd ?? true,
+    parsePathsFrontmatter,
+    fileTrustCtx: wsTrustCtx,
+    importTrustCtx: wsTrustCtx,
+  });
 }
 
 export function loadConditionalRuleContent(
   ruleFilePath: string,
   workspaceRoot: string,
   scope: ClaudeRuleScope,
-  options?: { deduplicateNativeAgentsMd?: boolean },
+  options?: RuleExternalTrustOptions & {
+    deduplicateNativeAgentsMd?: boolean;
+  },
 ): ClaudeRuleEntry | null {
-  return loadSingleRuleFile(ruleFilePath, scope, {
-    workspaceRoot,
-    workspaceRoots: [workspaceRoot],
-    deduplicateNativeAgentsMd: options?.deduplicateNativeAgentsMd ?? true,
-    parsePathsFrontmatter: true,
-  });
+  return loadConditionalRuleContentWithDiagnostics(ruleFilePath, workspaceRoot, scope, options)
+    .entry;
 }

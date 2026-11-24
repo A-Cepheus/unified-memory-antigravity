@@ -89,7 +89,7 @@ flowchart LR
 
     subgraph Plugin["unified-memory-antigravity"]
         HK["Hook Runner (dist/hook.cjs)\nSessionStart · PostToolUse · PreInvocation"]
-        MCP["MCP Server (dist/mcp.cjs)\n10 Model Tools + 10 App-Only UI Tools"]
+        MCP["MCP Server (dist/mcp.cjs)\n10 Model Tools + 11 App-Only UI Tools"]
         UI["Native Desktop UI (dist/app.html)\nSidebar (global) & Side Pane (aux_pane)"]
     end
 
@@ -124,6 +124,7 @@ flowchart LR
 ### 2. `CLAUDE.md` & `.claude/rules/` (Claude Code Parity)
 - **Full Scope Hierarchy**: Loads `Managed → User → Ancestor → Project → CLAUDE.local.md` across multi-root workspaces.
 - **Smart Parsing**: Expands `@import` up to 5 hops (with cycle detection and fenced code-block skipping), strips HTML comments outside code blocks, applies `claudeMdExcludes`, and deduplicates `@AGENTS.md` imports already loaded natively by Antigravity.
+- **External Import & Symlink Trust Boundary**: User/managed rules (`~/.claude/CLAUDE.md`, `~/.claude/rules/`) remain trusted by default, while repository-provided rules (`CLAUDE.md`, `.claude/CLAUDE.md`, `.claude/rules/`, `CLAUDE.local.md`, subdir/ancestor rules) block out-of-workspace `@import`s and rule symlinks unless explicitly approved per target/directory in the user-only **Rules & Context** dashboard or already approved for that project in Claude Code (`~/.claude.json`, read-only).
 - **Two-Stage Lazy Loading**: `PostToolUse` (`read_file|edit_file|write_file`) queues matching `paths:` rules (`**` + `{a,b}` brace expansion) and subdirectory `CLAUDE.md` files; `PreInvocation` delivers them on the next model turn.
 
 ### 3. OpenAI Codex CLI Memory (`Strictly Read-Only`)
@@ -159,7 +160,7 @@ flowchart LR
 | `codex_memory_read` | Read | Read a single Codex memory file inside the allowed path jail (read-only) |
 
 > [!NOTE]
-> Ten additional `ui_*` tools power the embedded MCP App and are tagged `visibility: ["app"]`, keeping them completely hidden from the model's tool context.
+> Eleven additional `ui_*` tools power the embedded MCP App (including user-only external rule trust management) and are tagged `visibility: ["app"]`, keeping them completely hidden from the model's tool context.
 
 ### Bundled Skills & Standing Rules
 - **`memory-manage`** (`skills/memory-manage/SKILL.md`) — Interactive status, rule-loading diagnostics, and dashboard walkthrough (equivalent to Claude Code's `/memory`).
@@ -178,6 +179,8 @@ Settings are persisted at `~/.gemini/antigravity/plugin_data/unified-memory-anti
 | `codexSummaryMaxBytes` | `8192` | Maximum bytes injected from Codex `memory_summary.md` |
 | `injectCodexGlobalAgentsMd` | `false` | Also inject `~/.codex/AGENTS.md` (and `AGENTS.override.md`) at startup |
 | `deduplicateNativeAgentsMd` | `true` | Skip `@AGENTS.md` imports already loaded natively by Antigravity |
+| `trustClaudeCodeExternalApprovals` | `true` | Reuse project-level external include approvals from `~/.claude.json` (read-only) |
+| `externalRuleTrust` | `{}` | Per-workspace allow/deny target paths for external `@import`s & rule symlinks (managed via UI) |
 | `maxStartupInjectBytes` | `65536` | Upper bound for combined `SessionStart` system injection |
 
 <details>

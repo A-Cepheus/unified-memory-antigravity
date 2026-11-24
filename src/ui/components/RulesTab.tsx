@@ -1,5 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import type { CallToolFn, ClaudeRuleEntry, RulesInspectPayload } from '../types.js';
+import type {
+  ApprovedExternalRuleTarget,
+  BlockedExternalRuleTarget,
+  CallToolFn,
+  ClaudeRuleEntry,
+  RulesInspectPayload,
+} from '../types.js';
 
 interface Props {
   workspaceHints: string[];
@@ -7,6 +13,40 @@ interface Props {
   onSelectWorkspace: (ws: string) => void;
   callTool: CallToolFn;
   onNotify: (msg: string, tone?: 'info' | 'success' | 'warn' | 'danger') => void;
+}
+
+function getSafeParentDir(targetPath: string): string | null {
+  const normalized = targetPath.replace(/[\\/]+$/, '');
+  const idx = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf('\\'));
+  if (idx <= 0) return null;
+  const parent = normalized.slice(0, idx);
+  // Avoid offering 1-click approval of filesystem root or immediate home root (/Users/<name>, /home/<name>, C:\Users\<name>)
+  const segments = parent.split(/[\\/]/).filter(Boolean);
+  if (
+    (segments.length <= 2 && (segments[0] === 'Users' || segments[0] === 'home')) ||
+    (segments.length <= 3 && /^[A-Za-z]:$/.test(segments[0]) && segments[1] === 'Users')
+  ) {
+    return null;
+  }
+  return parent;
+}
+
+function formatKindLabel(kind: BlockedExternalRuleTarget['kind']): string {
+  if (kind === 'external_import') return '@import';
+  if (kind === 'external_rule_dir_symlink') return 'dir symlink';
+  return 'rule symlink';
+}
+
+function formatBlockStatusLabel(status: BlockedExternalRuleTarget['status']): string {
+  if (status === 'denied_by_plugin') return 'dismissed';
+  if (status === 'denied_by_claude_code') return 'declined in Claude Code';
+  return 'pending approval';
+}
+
+function formatApprovalSourceLabel(source: ApprovedExternalRuleTarget['approvedBy']): string {
+  if (source === 'claude_code_project_approval') return 'Claude Code (~/.claude.json)';
+  if (source === 'plugin_dir_allowlist') return 'allowed dir';
+  return 'allowed file';
 }
 
 export const RulesTab: React.FC<Props> = ({
@@ -17,8 +57,10 @@ export const RulesTab: React.FC<Props> = ({
   onNotify,
 }) => {
   const [inputPath, setInputPath] = useState(selectedWorkspace || workspaceHints[0] || '');
+  const [manualTrustPath, setManualTrustPath] = useState('');
   const [data, setData] = useState<RulesInspectPayload | null>(null);
   const [loading, setLoading] = useState(false);
+  const [savingTrust, setSavingTrust] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const inspect = async (wsPath: string) => {
@@ -32,6 +74,33 @@ export const RulesTab: React.FC<Props> = ({
       onNotify(err instanceof Error ? err.message : String(err), 'danger');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const updateExternalTrust = async (
+    workspacePath: string,
+    action: 'allow' | 'deny' | 'revoke' | 'clear_workspace',
+    targetPath?: string,
+  ) => {
+    setSavingTrust(true);
+    try {
+      await callTool('ui_update_external_trust', {
+        workspacePath,
+        action,
+        ...(targetPath ? { targetPath } : {}),
+      });
+      await inspect(workspacePath);
+      const msg =
+        action === 'allow'
+          ? 'Approved external target. Takes effect on next session or /compact.'
+          : action === 'deny'
+            ? 'Denied external target. Suppressed from startup notices.'
+            : 'Updated workspace external rule trust.';
+      onNotify(msg, action === 'allow' ? 'success' : 'info');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : String(err), 'danger');
+    } finally {
+      setSavingTrust(false);
     }
   };
 
@@ -94,6 +163,14 @@ export const RulesTab: React.FC<Props> = ({
           </div>
         )}
 
+        {rule.blockedExternalTargets && rule.blockedExternalTargets.length > 0 && (
+          <div className="um-row" style={{ marginTop: 6 }}>
+            <span className="um-badge danger">
+              Blocked external targets ({rule.blockedExternalTargets.length})
+            </span>
+          </div>
+        )}
+
         {isExpanded && <pre className="um-pre">{rule.content}</pre>}
       </div>
     );
@@ -150,6 +227,268 @@ export const RulesTab: React.FC<Props> = ({
               {data.globalConditional.map(renderRuleCard)}
             </div>
           )}
+        </div>
+      )}
+
+      {/* External Imports & Symlinks Trust Panel (always visible for inspected workspace) */}
+      {data?.workspace && (
+        <div className="um-card um-section">
+          <div className="um-card-header">
+            <div className="um-row">
+              <h3 className="um-card-title">External Imports &amp; Rule Symlinks Trust</h3>
+              {data.workspace.claudeCodeExternalApproval?.approved ? (
+                <span className="um-badge success">
+                  Claude Code: Approved (~/.claude.json
+                  {data.trustClaudeCodeExternalApprovals ? ', active' : ', ignored by setting'})
+                </span>
+              ) : data.workspace.claudeCodeExternalApproval?.warningShown ? (
+                <span className="um-badge warn">Claude Code: Declined (~/.claude.json)</span>
+              ) : (
+                <span className="um-badge">Claude Code: Not approved</span>
+              )}
+            </div>
+            <span className="um-muted">
+              User-only controls · Repo rules outside workspace stay blocked unless trusted
+            </span>
+          </div>
+
+          {(data.workspace.blockedExternalTargets ?? []).length === 0 &&
+            (data.workspace.approvedExternalTargets ?? []).length === 0 && (
+              <div className="um-muted" style={{ marginBottom: 10 }}>
+                No external <code>@import</code>s or rule symlinks detected in this workspace. When
+                a repository rule points outside this workspace, it will appear here for one-click
+                approval or dismissal.
+              </div>
+            )}
+
+          {(data.workspace.blockedExternalTargets ?? []).length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div className="um-muted" style={{ marginBottom: 6 }}>
+                Blocked external targets ({data.workspace.blockedExternalTargets.length}):
+              </div>
+              <div className="um-list">
+                {data.workspace.blockedExternalTargets.map((item) => {
+                  const parentDir = item.targetIsDir ? null : getSafeParentDir(item.resolvedTarget);
+                  return (
+                    <div
+                      className="um-item"
+                      key={`${item.kind}-${item.sourceFile}-${item.resolvedTarget}`}
+                    >
+                      <div className="um-row-between">
+                        <div className="um-row">
+                          <span
+                            className={`um-badge ${
+                              item.status === 'pending_approval' ? 'danger' : 'warn'
+                            }`}
+                          >
+                            {formatBlockStatusLabel(item.status)}
+                          </span>
+                          <span className="um-badge info">{formatKindLabel(item.kind)}</span>
+                          <span className="um-mono">{item.sourceDisplayPath}</span>
+                          {item.rawRef && (
+                            <span className="um-muted um-mono">→ @{item.rawRef}</span>
+                          )}
+                        </div>
+                        <div className="um-row">
+                          <button
+                            className="um-btn sm primary"
+                            disabled={savingTrust}
+                            onClick={() =>
+                              updateExternalTrust(
+                                data.workspace!.workspaceRoot,
+                                'allow',
+                                item.resolvedTarget,
+                              )
+                            }
+                          >
+                            {item.targetIsDir ? 'Approve Dir' : 'Approve File'}
+                          </button>
+                          {parentDir && (
+                            <button
+                              className="um-btn sm"
+                              disabled={savingTrust}
+                              title={parentDir}
+                              onClick={() =>
+                                updateExternalTrust(
+                                  data.workspace!.workspaceRoot,
+                                  'allow',
+                                  parentDir,
+                                )
+                              }
+                            >
+                              Approve Parent Dir
+                            </button>
+                          )}
+                          {item.status === 'denied_by_plugin' ? (
+                            <button
+                              className="um-btn sm"
+                              disabled={savingTrust}
+                              onClick={() =>
+                                updateExternalTrust(
+                                  data.workspace!.workspaceRoot,
+                                  'revoke',
+                                  item.resolvedTarget,
+                                )
+                              }
+                            >
+                              Reset
+                            </button>
+                          ) : (
+                            <button
+                              className="um-btn sm"
+                              disabled={savingTrust}
+                              onClick={() =>
+                                updateExternalTrust(
+                                  data.workspace!.workspaceRoot,
+                                  'deny',
+                                  item.resolvedTarget,
+                                )
+                              }
+                            >
+                              Dismiss
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="um-mono um-muted" style={{ marginTop: 4 }}>
+                        Target: {item.resolvedTarget}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {(data.workspace.approvedExternalTargets ?? []).length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div className="um-muted" style={{ marginBottom: 6 }}>
+                Active external targets loaded ({data.workspace.approvedExternalTargets.length}):
+              </div>
+              <div className="um-list">
+                {data.workspace.approvedExternalTargets.map((item) => (
+                  <div
+                    className="um-item"
+                    key={`${item.kind}-${item.sourceDisplayPath}-${item.resolvedTarget}`}
+                  >
+                    <div className="um-row-between">
+                      <div className="um-row">
+                        <span className="um-badge success">
+                          {formatApprovalSourceLabel(item.approvedBy)}
+                        </span>
+                        <span className="um-badge info">{formatKindLabel(item.kind)}</span>
+                        <span className="um-mono">{item.sourceDisplayPath}</span>
+                      </div>
+                      <button
+                        className="um-btn sm danger"
+                        disabled={savingTrust}
+                        onClick={() =>
+                          updateExternalTrust(
+                            data.workspace!.workspaceRoot,
+                            'deny',
+                            item.resolvedTarget,
+                          )
+                        }
+                      >
+                        Block
+                      </button>
+                    </div>
+                    <div className="um-mono um-muted" style={{ marginTop: 4 }}>
+                      Target: {item.resolvedTarget}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {((data.workspaceExternalTrust?.allowPaths ?? []).length > 0 ||
+            (data.workspaceExternalTrust?.denyPaths ?? []).length > 0) && (
+            <div style={{ marginBottom: 10 }}>
+              <div className="um-row-between" style={{ marginBottom: 6 }}>
+                <span className="um-muted">Saved plugin trust overrides for this workspace:</span>
+                <button
+                  className="um-btn sm"
+                  disabled={savingTrust}
+                  onClick={() =>
+                    updateExternalTrust(data.workspace!.workspaceRoot, 'clear_workspace')
+                  }
+                >
+                  Clear All Overrides
+                </button>
+              </div>
+              <div className="um-list">
+                {(data.workspaceExternalTrust?.allowPaths ?? []).map((p) => (
+                  <div className="um-item um-row-between" key={`allow-${p}`}>
+                    <div className="um-row">
+                      <span className="um-badge success">allow</span>
+                      <span className="um-mono">{p}</span>
+                    </div>
+                    <button
+                      className="um-btn sm"
+                      disabled={savingTrust}
+                      onClick={() =>
+                        updateExternalTrust(data.workspace!.workspaceRoot, 'revoke', p)
+                      }
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                ))}
+                {(data.workspaceExternalTrust?.denyPaths ?? []).map((p) => (
+                  <div className="um-item um-row-between" key={`deny-${p}`}>
+                    <div className="um-row">
+                      <span className="um-badge danger">deny</span>
+                      <span className="um-mono">{p}</span>
+                    </div>
+                    <button
+                      className="um-btn sm"
+                      disabled={savingTrust}
+                      onClick={() =>
+                        updateExternalTrust(data.workspace!.workspaceRoot, 'revoke', p)
+                      }
+                    >
+                      Revoke
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="um-row">
+            <input
+              className="um-input"
+              style={{ flex: 1, minWidth: 200 }}
+              value={manualTrustPath}
+              onChange={(e) => setManualTrustPath(e.target.value)}
+              placeholder="~/notes/writing-style.md or ~/shared-rules"
+            />
+            <button
+              className="um-btn sm primary"
+              disabled={savingTrust || !manualTrustPath.trim()}
+              onClick={async () => {
+                const target = manualTrustPath.trim();
+                if (!target) return;
+                await updateExternalTrust(data.workspace!.workspaceRoot, 'allow', target);
+                setManualTrustPath('');
+              }}
+            >
+              + Allow Path
+            </button>
+            <button
+              className="um-btn sm"
+              disabled={savingTrust || !manualTrustPath.trim()}
+              onClick={async () => {
+                const target = manualTrustPath.trim();
+                if (!target) return;
+                await updateExternalTrust(data.workspace!.workspaceRoot, 'deny', target);
+                setManualTrustPath('');
+              }}
+            >
+              + Deny Path
+            </button>
+          </div>
         </div>
       )}
 

@@ -17,6 +17,7 @@ import {
   getClaudeConfigDir,
   getCodexHome,
   getCodexMemoryStatus,
+  getWorkspaceExternalTrust,
   listCodexFiles,
   listRecentSessions,
   listTopicMemories,
@@ -32,13 +33,14 @@ import {
   savePluginConfig,
   saveTopicMemory,
   searchCodexMemories,
+  updateWorkspaceExternalTrust,
   writeMemoryIndexRaw,
   type ClaudeMemoryType,
 } from '../core/index.js';
 
 export const APP_URI = 'ui://unified-memory/app.html';
 export const SERVER_NAME = 'unified-memory';
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.2.0';
 
 export interface McpServerOptions {
   env?: NodeJS.ProcessEnv;
@@ -494,7 +496,7 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
     {
       title: 'Inspect Claude Rules & CLAUDE.md',
       description:
-        'Inspect all CLAUDE.md hierarchy files (with @import chains and AGENTS.md deduplication) and .claude/rules/ files (always-on vs paths-scoped) for a workspace.',
+        'Inspect all CLAUDE.md hierarchy files (with @import chains, external trust status, and AGENTS.md deduplication) and .claude/rules/ files (always-on vs paths-scoped) for a workspace.',
       inputSchema: {
         workspacePath: z.string().describe('Absolute path to the workspace directory.'),
       },
@@ -503,7 +505,10 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
       const cfg = loadPluginConfig(dataDir);
       const loaded = loadClaudeRulesForWorkspaces([workspacePath], {
         claudeConfigDir,
+        homeDir,
         deduplicateNativeAgentsMd: cfg.deduplicateNativeAgentsMd,
+        trustClaudeCodeExternalApprovals: cfg.trustClaudeCodeExternalApprovals,
+        externalRuleTrust: cfg.externalRuleTrust,
       });
       const ws = loaded.workspaces[0];
       const summarize = (r: (typeof loaded.globalAlwaysOn)[number]) => ({
@@ -514,8 +519,14 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
         paths: r.paths,
         imports: r.imports,
         skippedDuplicateAgentsMd: r.skippedDuplicateAgentsMd,
+        blockedExternalCount: r.blockedExternalTargets.length,
+        approvedExternalCount: r.approvedExternalTargets.length,
         sizeBytes: r.sizeBytes,
       });
+      const blockedExternalCount = ws ? ws.blockedExternalTargets.length : 0;
+      const pendingExternalApprovalCount = ws
+        ? ws.blockedExternalTargets.filter((b) => b.status === 'pending_approval').length
+        : 0;
       return {
         content: [
           {
@@ -527,6 +538,18 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
               projectAlwaysOn: ws ? ws.alwaysOn.map(summarize) : [],
               projectConditional: ws ? ws.conditional.map(summarize) : [],
               excludedPaths: ws ? ws.excludedPaths : [],
+              externalTrustSummary: {
+                trustClaudeCodeExternalApprovals: cfg.trustClaudeCodeExternalApprovals,
+                claudeCodeExternalApproved: ws?.claudeCodeExternalApproval?.approved ?? null,
+                approvedExternalCount: ws ? ws.approvedExternalTargets.length : 0,
+                blockedExternalCount,
+                pendingExternalApprovalCount,
+                ...(pendingExternalApprovalCount > 0
+                  ? {
+                      note: 'External targets outside this workspace require user approval in the Unified Memory dashboard (open_memory_dashboard, tab="rules").',
+                    }
+                  : {}),
+              },
             }),
           },
         ],
@@ -840,7 +863,8 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
   server.registerTool(
     'ui_inspect_rules',
     {
-      description: 'App-only: inspect CLAUDE.md hierarchy, @imports, and .claude/rules for a workspace.',
+      description:
+        'App-only: inspect CLAUDE.md hierarchy, @imports, external trust status, and .claude/rules for a workspace.',
       inputSchema: {
         workspacePath: z.string().optional(),
       },
@@ -851,7 +875,10 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
       const wsList = workspacePath?.trim() ? [workspacePath.trim()] : [];
       const loaded = loadClaudeRulesForWorkspaces(wsList, {
         claudeConfigDir,
+        homeDir,
         deduplicateNativeAgentsMd: cfg.deduplicateNativeAgentsMd,
+        trustClaudeCodeExternalApprovals: cfg.trustClaudeCodeExternalApprovals,
+        externalRuleTrust: cfg.externalRuleTrust,
       });
       const sessions = listRecentSessions(dataDir, 10);
       const payload = {
@@ -859,6 +886,10 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
         globalAlwaysOn: loaded.globalAlwaysOn,
         globalConditional: loaded.globalConditional,
         workspace: loaded.workspaces[0] ?? null,
+        workspaceExternalTrust: wsList[0]
+          ? getWorkspaceExternalTrust(cfg.externalRuleTrust, wsList[0])
+          : { allowPaths: [], denyPaths: [] },
+        trustClaudeCodeExternalApprovals: cfg.trustClaudeCodeExternalApprovals,
         recentSessionHits: sessions
           .filter((s) => s.loadedRuleKeys.length > 0 || s.loadedSubdirPaths.length > 0)
           .map((s) => ({
@@ -877,6 +908,32 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
   );
 
   server.registerTool(
+    'ui_update_external_trust',
+    {
+      description:
+        'App-only: approve, deny, revoke, or clear trusted external @import / rule symlink paths for a workspace.',
+      inputSchema: {
+        workspacePath: z.string().min(1),
+        action: z.enum(['allow', 'deny', 'revoke', 'clear_workspace']),
+        targetPath: z.string().optional(),
+      },
+      _meta: APP_ONLY_META,
+    },
+    async ({ workspacePath, action, targetPath }) => {
+      const result = updateWorkspaceExternalTrust(workspacePath, action, targetPath, dataDir);
+      const payload = {
+        workspaceKey: result.workspaceKey,
+        trust: result.trust,
+        trustClaudeCodeExternalApprovals: result.config.trustClaudeCodeExternalApprovals,
+      };
+      return {
+        content: [{ type: 'text', text: jsonText(payload) }],
+        structuredContent: payload as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  server.registerTool(
     'ui_update_config',
     {
       description: 'App-only: update Unified Memory plugin runtime settings.',
@@ -886,6 +943,7 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
         injectCodexGlobalAgentsMd: z.boolean().optional(),
         deduplicateNativeAgentsMd: z.boolean().optional(),
         maxStartupInjectBytes: z.number().int().min(4096).max(262144).optional(),
+        trustClaudeCodeExternalApprovals: z.boolean().optional(),
       },
       _meta: APP_ONLY_META,
     },

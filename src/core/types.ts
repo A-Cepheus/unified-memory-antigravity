@@ -84,6 +84,50 @@ export type ClaudeRuleScope =
   | 'local'
   | 'subdir';
 
+export type ExternalRuleTargetKind =
+  | 'external_import'
+  | 'external_rule_symlink'
+  | 'external_rule_dir_symlink';
+
+export type ExternalRuleBlockStatus =
+  | 'pending_approval'
+  | 'denied_by_plugin'
+  | 'denied_by_claude_code';
+
+export type ExternalRuleApprovalSource =
+  | 'plugin_file_allowlist'
+  | 'plugin_dir_allowlist'
+  | 'claude_code_project_approval';
+
+export interface BlockedExternalRuleTarget {
+  kind: ExternalRuleTargetKind;
+  sourceFile: string;
+  sourceDisplayPath: string;
+  sourceScope: ClaudeRuleScope;
+  rawRef?: string;
+  resolvedTarget: string;
+  targetIsDir: boolean;
+  status: ExternalRuleBlockStatus;
+}
+
+export interface ApprovedExternalRuleTarget {
+  kind: ExternalRuleTargetKind;
+  sourceDisplayPath: string;
+  resolvedTarget: string;
+  approvedBy: ExternalRuleApprovalSource;
+}
+
+export interface ClaudeCodeExternalApprovalState {
+  approved: boolean;
+  warningShown: boolean;
+  matchedProjectKey?: string;
+}
+
+export interface WorkspaceExternalTrustConfig {
+  allowPaths: string[];
+  denyPaths: string[];
+}
+
 export interface ClaudeRuleEntry {
   id: string;
   filePath: string;
@@ -95,6 +139,8 @@ export interface ClaudeRuleEntry {
   content: string;
   imports: string[];
   skippedDuplicateAgentsMd: string[];
+  blockedExternalTargets: BlockedExternalRuleTarget[];
+  approvedExternalTargets: ApprovedExternalRuleTarget[];
   sizeBytes: number;
   mtimeMs: number;
 }
@@ -104,6 +150,9 @@ export interface WorkspaceRulesBundle {
   alwaysOn: ClaudeRuleEntry[];
   conditional: ClaudeRuleEntry[];
   excludedPaths: string[];
+  blockedExternalTargets: BlockedExternalRuleTarget[];
+  approvedExternalTargets: ApprovedExternalRuleTarget[];
+  claudeCodeExternalApproval: ClaudeCodeExternalApprovalState | null;
 }
 
 export interface CodexGenerationStats {
@@ -159,6 +208,7 @@ export interface IndexedConditionalRule {
 export interface PendingInjection {
   key: string;
   kind: 'scoped_rule' | 'subdir_claude_md';
+  scope?: ClaudeRuleScope;
   filePath: string;
   displayPath: string;
   workspaceRoot: string;
@@ -203,6 +253,8 @@ export interface UnifiedMemoryConfig {
   injectCodexGlobalAgentsMd: boolean;
   deduplicateNativeAgentsMd: boolean;
   maxStartupInjectBytes: number;
+  trustClaudeCodeExternalApprovals: boolean;
+  externalRuleTrust: Record<string, WorkspaceExternalTrustConfig>;
 }
 
 export const DEFAULT_CONFIG: UnifiedMemoryConfig = {
@@ -211,4 +263,6 @@ export const DEFAULT_CONFIG: UnifiedMemoryConfig = {
   injectCodexGlobalAgentsMd: false,
   deduplicateNativeAgentsMd: true,
   maxStartupInjectBytes: 64 * 1024,
+  trustClaudeCodeExternalApprovals: true,
+  externalRuleTrust: {},
 };

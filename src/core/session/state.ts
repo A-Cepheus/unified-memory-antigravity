@@ -6,8 +6,10 @@ import {
   type DiagnosticEvent,
   type SessionState,
   type UnifiedMemoryConfig,
+  type WorkspaceExternalTrustConfig,
 } from '../types.js';
 import { atomicWriteFile } from '../claude/memory.js';
+import { canonicalizeFsPath } from '../claude/paths.js';
 
 const MAX_DIAGNOSTIC_LINES = 300;
 const STALE_SESSION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -26,9 +28,45 @@ export function resolvePluginDataDir(env: NodeJS.ProcessEnv = process.env): stri
   }
 }
 
+function sanitizePathArray(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of input) {
+    if (typeof item !== 'string' || !item.trim()) continue;
+    const cleaned = item.trim();
+    if (!seen.has(cleaned)) {
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+  }
+  return out;
+}
+
+function sanitizeExternalRuleTrust(
+  input: unknown,
+): Record<string, WorkspaceExternalTrustConfig> {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const result: Record<string, WorkspaceExternalTrustConfig> = {};
+  for (const [rawKey, rawVal] of Object.entries(input as Record<string, unknown>)) {
+    if (!rawKey.trim() || !rawVal || typeof rawVal !== 'object' || Array.isArray(rawVal)) {
+      continue;
+    }
+    const rec = rawVal as Record<string, unknown>;
+    const allowPaths = sanitizePathArray(rec.allowPaths);
+    const denyPaths = sanitizePathArray(rec.denyPaths);
+    if (allowPaths.length > 0 || denyPaths.length > 0) {
+      result[rawKey.trim()] = { allowPaths, denyPaths };
+    }
+  }
+  return result;
+}
+
 export function loadPluginConfig(dataDir: string = resolvePluginDataDir()): UnifiedMemoryConfig {
   const cfgPath = path.join(dataDir, 'config.json');
-  if (!fs.existsSync(cfgPath)) return { ...DEFAULT_CONFIG };
+  if (!fs.existsSync(cfgPath)) {
+    return { ...DEFAULT_CONFIG, externalRuleTrust: {} };
+  }
   try {
     const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as Partial<UnifiedMemoryConfig>;
     return {
@@ -52,9 +90,14 @@ export function loadPluginConfig(dataDir: string = resolvePluginDataDir()): Unif
         typeof raw.maxStartupInjectBytes === 'number' && raw.maxStartupInjectBytes >= 4096
           ? raw.maxStartupInjectBytes
           : DEFAULT_CONFIG.maxStartupInjectBytes,
+      trustClaudeCodeExternalApprovals:
+        typeof raw.trustClaudeCodeExternalApprovals === 'boolean'
+          ? raw.trustClaudeCodeExternalApprovals
+          : DEFAULT_CONFIG.trustClaudeCodeExternalApprovals,
+      externalRuleTrust: sanitizeExternalRuleTrust(raw.externalRuleTrust),
     };
   } catch {
-    return { ...DEFAULT_CONFIG };
+    return { ...DEFAULT_CONFIG, externalRuleTrust: {} };
   }
 }
 
@@ -62,9 +105,102 @@ export function savePluginConfig(
   patch: Partial<UnifiedMemoryConfig>,
   dataDir: string = resolvePluginDataDir(),
 ): UnifiedMemoryConfig {
-  const next = { ...loadPluginConfig(dataDir), ...patch };
+  const current = loadPluginConfig(dataDir);
+  const next: UnifiedMemoryConfig = {
+    ...current,
+    ...patch,
+    externalRuleTrust:
+      patch.externalRuleTrust !== undefined
+        ? sanitizeExternalRuleTrust(patch.externalRuleTrust)
+        : current.externalRuleTrust,
+  };
   atomicWriteFile(path.join(dataDir, 'config.json'), JSON.stringify(next, null, 2) + '\n');
   return next;
+}
+
+export function getWorkspaceExternalTrust(
+  externalRuleTrust: Record<string, WorkspaceExternalTrustConfig> | undefined,
+  workspaceRoot: string,
+): WorkspaceExternalTrustConfig {
+  if (!externalRuleTrust) return { allowPaths: [], denyPaths: [] };
+  const resolvedWs = path.resolve(workspaceRoot);
+  const realWs = canonicalizeFsPath(workspaceRoot);
+  const allowSet = new Set<string>();
+  const denySet = new Set<string>();
+
+  for (const [key, entry] of Object.entries(externalRuleTrust)) {
+    const normKey = path.resolve(key);
+    if (normKey === resolvedWs || normKey === realWs || canonicalizeFsPath(normKey) === realWs) {
+      for (const p of entry.allowPaths) allowSet.add(canonicalizeFsPath(p));
+      for (const p of entry.denyPaths) denySet.add(canonicalizeFsPath(p));
+    }
+  }
+
+  return {
+    allowPaths: Array.from(allowSet).sort(),
+    denyPaths: Array.from(denySet).sort(),
+  };
+}
+
+export type ExternalTrustAction = 'allow' | 'deny' | 'revoke' | 'clear_workspace';
+
+export function updateWorkspaceExternalTrust(
+  workspaceRoot: string,
+  action: ExternalTrustAction,
+  targetPath?: string,
+  dataDir: string = resolvePluginDataDir(),
+): {
+  config: UnifiedMemoryConfig;
+  workspaceKey: string;
+  trust: WorkspaceExternalTrustConfig;
+} {
+  const config = loadPluginConfig(dataDir);
+  const wsKey = canonicalizeFsPath(workspaceRoot);
+  const resolvedWs = path.resolve(workspaceRoot);
+
+  // Merge any alias keys for this workspace under canonical wsKey
+  const existing = getWorkspaceExternalTrust(config.externalRuleTrust, workspaceRoot);
+  const nextMap: Record<string, WorkspaceExternalTrustConfig> = {};
+  for (const [k, v] of Object.entries(config.externalRuleTrust)) {
+    const nk = path.resolve(k);
+    if (nk === resolvedWs || nk === wsKey || canonicalizeFsPath(nk) === wsKey) continue;
+    nextMap[k] = v;
+  }
+
+  if (action === 'clear_workspace') {
+    const saved = savePluginConfig({ externalRuleTrust: nextMap }, dataDir);
+    return { config: saved, workspaceKey: wsKey, trust: { allowPaths: [], denyPaths: [] } };
+  }
+
+  if (!targetPath || !targetPath.trim()) {
+    throw new Error(`targetPath is required for action "${action}"`);
+  }
+
+  const canonicalTarget = canonicalizeFsPath(targetPath);
+  const allowSet = new Set(existing.allowPaths);
+  const denySet = new Set(existing.denyPaths);
+
+  if (action === 'allow') {
+    allowSet.add(canonicalTarget);
+    denySet.delete(canonicalTarget);
+  } else if (action === 'deny') {
+    denySet.add(canonicalTarget);
+    allowSet.delete(canonicalTarget);
+  } else if (action === 'revoke') {
+    allowSet.delete(canonicalTarget);
+    denySet.delete(canonicalTarget);
+  }
+
+  const nextTrust: WorkspaceExternalTrustConfig = {
+    allowPaths: Array.from(allowSet).sort(),
+    denyPaths: Array.from(denySet).sort(),
+  };
+  if (nextTrust.allowPaths.length > 0 || nextTrust.denyPaths.length > 0) {
+    nextMap[wsKey] = nextTrust;
+  }
+
+  const saved = savePluginConfig({ externalRuleTrust: nextMap }, dataDir);
+  return { config: saved, workspaceKey: wsKey, trust: nextTrust };
 }
 
 function safeConversationKey(conversationId: string): string {

@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "unified-memory-antigravity",
   "displayName": "Unified Memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bridge Claude Code Auto Memory & rules (read-write) with OpenAI Codex CLI memory (read-only), plus a native Antigravity Desktop UI.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

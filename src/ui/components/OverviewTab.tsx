@@ -281,6 +281,25 @@ export const OverviewTab: React.FC<Props> = ({
 
         <div className="um-toggle">
           <div>
+            <div>Reuse Claude Code External Import Approvals (~/.claude.json)</div>
+            <div className="um-muted">
+              Read-only interop: honors projects already approved in Claude Code. Unapproved
+              external @imports and rule symlinks stay blocked until approved in Rules &amp;
+              Context.
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            checked={overview.config.trustClaudeCodeExternalApprovals}
+            disabled={savingCfg}
+            onChange={(e) =>
+              updateCfg({ trustClaudeCodeExternalApprovals: e.target.checked })
+            }
+          />
+        </div>
+
+        <div className="um-toggle">
+          <div>
             <div>Also Inject Global ~/.codex/AGENTS.md (or AGENTS.override.md)</div>
             <div className="um-muted">Optional global Codex instructions on SessionStart.</div>
           </div>

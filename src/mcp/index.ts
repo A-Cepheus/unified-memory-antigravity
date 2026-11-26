@@ -40,7 +40,7 @@ import {
 
 export const APP_URI = 'ui://unified-memory/app.html';
 export const SERVER_NAME = 'unified-memory';
-export const SERVER_VERSION = '0.2.0';
+export const SERVER_VERSION = '0.2.1';
 
 export interface McpServerOptions {
   env?: NodeJS.ProcessEnv;
@@ -404,11 +404,14 @@ export function createUnifiedMemoryServer(options: McpServerOptions = {}): McpSe
         description: z
           .string()
           .min(1)
-          .describe('Concise one-line description used for relevance recall and MEMORY.md index.'),
+          .describe('Specific, concise one-line description (<= 150 chars) used for relevance recall and MEMORY.md index.'),
         type: z
           .enum(['user', 'feedback', 'project', 'reference'])
           .describe('Claude Code memory category.'),
-        body: z.string().min(1).describe('Markdown content of the memory note.'),
+        body: z
+          .string()
+          .min(1)
+          .describe('Markdown content of the memory note. For feedback/project memories, lead with the rule/decision followed by **Why:** and **How to apply:**.'),
         filename: z
           .string()
           .optional()

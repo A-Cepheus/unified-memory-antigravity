@@ -68,7 +68,7 @@ export const AppView: React.FC = () => {
   }, []);
 
   const { app, isConnected, error } = useApp({
-    appInfo: { name: 'Unified Memory', version: '0.2.0' },
+    appInfo: { name: 'Unified Memory', version: '0.2.1' },
     capabilities: {},
     onAppCreated: (createdApp) => {
       createdApp.ontoolresult = (result) => {
@@ -148,7 +148,7 @@ export const AppView: React.FC = () => {
           <div className="um-brand">
             <span className="um-brand-dot" />
             <h1 className="um-title">Unified Memory</h1>
-            <span className="um-badge">v{overview?.version ?? '0.2.0'}</span>
+            <span className="um-badge">v{overview?.version ?? '0.2.1'}</span>
           </div>
           <div className="um-row">
             <span className={`um-badge ${isConnected ? 'success' : 'warn'}`}>

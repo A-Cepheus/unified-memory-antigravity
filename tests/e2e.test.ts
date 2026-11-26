@@ -31,6 +31,14 @@ describe('Built dist/ end-to-end verification (Hook + MCP Server + MCP App UI)',
     const html = fs.readFileSync(APP_HTML, 'utf8');
     assert.ok(html.includes('<script'), 'dist/app.html must inline JS');
     assert.ok(html.length < 10 * 1024 * 1024, 'dist/app.html must be < 10 MiB');
+
+    const standingRulePath = path.join(REPO_ROOT, 'rules', 'AGENTS.md');
+    const standingRule = fs.readFileSync(standingRulePath, 'utf8');
+    assert.ok(Buffer.byteLength(standingRule, 'utf8') < 24 * 1024, 'rules/AGENTS.md must stay under 24 KB');
+    assert.ok(standingRule.includes('Skip saving on routine turns'), 'Standing rule must guard against saving on routine turns');
+    assert.ok(standingRule.includes('record from failure AND success'));
+    assert.ok(standingRule.includes('**Why:**'));
+    assert.ok(standingRule.includes('**How to apply:**'));
   });
 
   it('runs SessionStart (idempotent) -> PostToolUse -> PreInvocation lazy injection -> compaction reload', () => {
